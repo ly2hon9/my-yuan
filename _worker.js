@@ -316,4 +316,406 @@ async function handleProxyRequest(request, currentOrigin) {
       statusText: response.statusText,
       headers: responseHeaders
     })
-  } catch
+  } catch (err) {
+    return jsonResponse({ error: 'Proxy Error', message: err.message }, 502)
+  }
+}
+
+// ================= 生成订阅处理 =================
+async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env) {
+  try {
+    const config = FORMAT_CONFIG[formatParam]
+    if (!config) return jsonResponse({ error: 'Invalid format parameter' }, 400)
+
+    let data = await fetchConfig(sourceParam, env)
+
+    const kv = getKV(env)
+    let disabledKeys = []
+    if (kv) {
+      try {
+        const stored = await kv.get(`DISABLED_${sourceParam}`)
+        if (stored) disabledKeys = JSON.parse(stored)
+      } catch {}
+    }
+
+    // 剔除禁用的源
+    data = filterDisabled(JSON.parse(JSON.stringify(data)), disabledKeys)
+
+    // 添加代理前缀
+    const finalData = config.proxy ? addOrReplacePrefix(data, prefixParam || defaultPrefix) : data
+
+    if (config.base58) {
+      return new Response(base58Encode(finalData), {
+        headers: { 'Content-Type': 'text/plain; charset=UTF-8', ...CORS_HEADERS },
+      })
+    } else {
+      return new Response(JSON.stringify(finalData), {
+        headers: { 'Content-Type': 'application/json; charset=UTF-8', ...CORS_HEADERS },
+      })
+    }
+  } catch (err) {
+    return jsonResponse({ error: err.message }, 500)
+  }
+}
+
+// ================= 图2 原版页面 UI =================
+async function handleHomePage(origin, env) {
+  // 服务端预载精简+成人版（默认），首屏直接输出源数据
+  let initialList = []
+  let initialDisabled = []
+  try {
+    const raw = await fetchConfig('jingjian', env)
+    initialList = extractSourceList(raw)
+    const kv = getKV(env)
+    if (kv) {
+      const stored = await kv.get('DISABLED_jingjian')
+      if (stored) initialDisabled = JSON.parse(stored)
+    }
+  } catch {}
+
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>订阅配置与测速管理</title>
+  <style>
+    :root {
+      --bg: #121417;
+      --card-bg: #1c2026;
+      --border: #2a303c;
+      --text: #e2e8f0;
+      --text-muted: #8c9ba5;
+      --primary: #1da1f2;
+      --danger: #e0245e;
+      --warning: #ffad1f;
+      --success: #17bf63;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 820px; margin: 25px auto; padding: 0 14px; background: var(--bg); color: var(--text); line-height: 1.5; }
+    h2 { font-size: 19px; color: #fff; margin: 18px 0 10px; display: flex; align-items: center; gap: 6px; }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 20px; }
+    
+    /* 顶部订阅链接条（图2风格） */
+    .link-box { display: flex; align-items: center; justify-content: space-between; margin: 10px 0; background: #15181e; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); gap: 8px; }
+    .link-text { font-size: 13px; color: #cbd5e1; word-break: break-all; }
+    .link-text code { font-family: monospace; color: var(--warning); background: rgba(255, 173, 31, 0.1); padding: 2px 5px; border-radius: 4px; }
+    .btn-copy { background: #0070f3; color: #fff; border: none; padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+    .btn-copy:hover { opacity: 0.9; }
+
+    /* 控制栏与操作按钮（图2原版） */
+    .select-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 14px; }
+    select { background: #15181e; color: #fff; border: 1px solid var(--border); padding: 6px 10px; border-radius: 6px; font-size: 13px; outline: none; }
+    
+    .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .btn-action { border: none; padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; color: #fff; }
+    .btn-blue { background: #0070f3; }
+    .btn-red { background: var(--danger); }
+    .btn-orange { background: var(--warning); color: #000; font-weight: bold; }
+    .btn-green { background: var(--success); }
+    .btn-action:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* 统计条（图2样式） */
+    .stats-bar { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; padding: 4px 0; }
+    .stats-bar span { font-weight: bold; color: #fff; margin: 0 3px; }
+
+    /* 表格结构（图2原版） */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border: 1px solid var(--border); padding: 10px 8px; text-align: left; }
+    th { background: #161a20; color: #94a3b8; font-weight: 500; }
+    tr:nth-child(even) { background: #16191f; }
+    .badge { display: inline-flex; align-items: center; justify-content: center; font-size: 14px; }
+    a.link-btn { color: var(--primary); text-decoration: none; }
+    a.link-btn:hover { text-decoration: underline; }
+
+    /* 启用开关（iOS风格） */
+    .switch { position: relative; display: inline-block; width: 38px; height: 20px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #4b5563; transition: .2s; border-radius: 20px; }
+    .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background-color: white; transition: .2s; border-radius: 50%; }
+    input:checked + .slider { background-color: var(--success); }
+    input:checked + .slider:before { transform: translateX(18px); }
+  </style>
+</head>
+<body>
+
+  <h2>⚡ 订阅配置拉取</h2>
+  <div class="card">
+    <div class="link-box">
+      <div class="link-text">
+        📦 <span id="labelJson">精简+成人 (推荐)</span>：<code id="urlJson">${origin}/?format=1&source=jingjian</code>
+      </div>
+      <button class="btn-copy" onclick="copyText(document.getElementById('urlJson').innerText)">复制</button>
+    </div>
+    <div class="link-box">
+      <div class="link-text">
+        📦 <span id="labelB58">Base58 格式</span>：<code id="urlB58">${origin}/?format=3&source=jingjian</code>
+      </div>
+      <button class="btn-copy" onclick="copyText(document.getElementById('urlB58').innerText)">复制</button>
+    </div>
+  </div>
+
+  <h2>📊 资源源测速与可用性管理</h2>
+  <div class="card">
+    <div class="select-row">
+      <label>选择配置：</label>
+      <select id="sourceSelect" onchange="onSourceChange()">
+        <option value="jingjian" selected>精简+成人版 (推荐)</option>
+        <option value="jin18">精简版 (31个资源)</option>
+        <option value="full">完整版 (88个资源)</option>
+      </select>
+    </div>
+
+    <div class="btn-group">
+      <button class="btn-action btn-blue" id="startBtn" onclick="runSpeedTest()">🚀 开始测速检测</button>
+      <button class="btn-action btn-red" onclick="disableFailedSources()">⛔ 禁用失效源</button>
+      <button class="btn-action btn-orange" onclick="resetSources()">🔄 重置全部源 (解除禁用)</button>
+      <button class="btn-action btn-green" id="saveBtn" onclick="saveState()">💾 保存同步</button>
+    </div>
+
+    <div class="stats-bar">
+      共计: <span id="totalCount">0</span> 个源 | 
+      可用: <span id="okCount" style="color:var(--success)">0</span> | 
+      失效: <span id="failCount" style="color:var(--danger)">0</span> | 
+      已禁用: <span id="disabledCount" style="color:var(--warning)">0</span>
+    </div>
+
+    <div style="overflow-x: auto;">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 45px; text-align: center;">状态</th>
+            <th>资源名称</th>
+            <th style="width: 60px; text-align: center;">API</th>
+            <th style="width: 80px; text-align: center;">搜索功能</th>
+            <th style="width: 85px; text-align: center;">响应延迟</th>
+            <th style="width: 65px; text-align: center;">启用</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const ORIGIN = '${origin}';
+    let sourcesList = ${JSON.stringify(initialList)};
+    let disabledSet = new Set(${JSON.stringify(initialDisabled)});
+    let isTesting = false;
+
+    // 渲染表格
+    function renderTable() {
+      const tbody = document.getElementById('tableBody');
+      tbody.innerHTML = '';
+      
+      let disabledNum = 0;
+      sourcesList.forEach((item, index) => {
+        const key = String(item.key || item.name || item.api);
+        const isEnabled = !disabledSet.has(key) && !disabledSet.has(item.name) && !disabledSet.has(item.api);
+        if (!isEnabled) disabledNum++;
+
+        const tr = document.createElement('tr');
+        tr.id = 'row-' + index;
+        tr.innerHTML = \`
+          <td style="text-align: center;"><span class="badge" id="status-\${index}">⚪</span></td>
+          <td>\${escapeHtml(item.name || '未命名')}</td>
+          <td style="text-align: center;"><a class="link-btn" href="\${item.api}" target="_blank">Link</a></td>
+          <td style="text-align: center;" id="search-\${index}"><span class="badge">⚪</span></td>
+          <td style="text-align: center; color:var(--text-muted);" id="speed-\${index}">-</td>
+          <td style="text-align: center;">
+            <label class="switch">
+              <input type="checkbox" \${isEnabled ? 'checked' : ''} data-key="\${escapeHtml(key)}" onchange="toggleEnable(this)">
+              <span class="slider"></span>
+            </label>
+          </td>
+        \`;
+        tbody.appendChild(tr);
+      });
+
+      document.getElementById('totalCount').innerText = sourcesList.length;
+      document.getElementById('disabledCount').innerText = disabledNum;
+    }
+
+    // 下拉框联动
+    async function onSourceChange() {
+      const source = document.getElementById('sourceSelect').value;
+      // 联动顶部订阅地址
+      document.getElementById('urlJson').innerText = \`\${ORIGIN}/?format=1&source=\${source}\`;
+      document.getElementById('urlB58').innerText = \`\${ORIGIN}/?format=3&source=\${source}\`;
+
+      const tbody = document.getElementById('tableBody');
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px; color:var(--text-muted);">正在拉取资源列表...</td></tr>';
+      
+      try {
+        const res = await fetch('/api/manage/sources?source=' + source);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        sourcesList = data.list || [];
+        disabledSet = new Set(data.disabled || []);
+        renderTable();
+      } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color:var(--danger); padding: 15px;">加载失败: ' + e.message + '</td></tr>';
+      }
+    }
+
+    function toggleEnable(el) {
+      const key = el.getAttribute('data-key');
+      if (el.checked) {
+        disabledSet.delete(key);
+      } else {
+        disabledSet.add(key);
+      }
+      document.getElementById('disabledCount').innerText = disabledSet.size;
+    }
+
+    // 单个测速与搜索检测
+    async function testSingle(item, index) {
+      const statusEl = document.getElementById('status-' + index);
+      const searchEl = document.getElementById('search-' + index);
+      const speedEl = document.getElementById('speed-' + index);
+
+      let targetUrl = item.api;
+      const delimiter = targetUrl.includes('?') ? '&' : '?';
+      const testSearchUrl = ORIGIN + '/?url=' + encodeURIComponent(targetUrl + delimiter + 'ac=detail&wd=爱');
+
+      const startTime = Date.now();
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
+        const res = await fetch(testSearchUrl, { signal: controller.signal });
+        clearTimeout(timeout);
+        
+        const latency = Date.now() - startTime;
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const json = await res.json();
+        const hasList = (json && (Array.isArray(json.list) && json.list.length > 0)) || json.code === 1;
+
+        speedEl.innerText = latency + 'ms';
+        speedEl.style.color = latency < 1500 ? 'var(--success)' : 'var(--warning)';
+        statusEl.innerHTML = '✅';
+
+        if (hasList) {
+          searchEl.innerHTML = '✅';
+          return true;
+        } else {
+          searchEl.innerHTML = '❌';
+          return false;
+        }
+      } catch (e) {
+        speedEl.innerText = '失败';
+        speedEl.style.color = 'var(--danger)';
+        statusEl.innerHTML = '❌';
+        searchEl.innerHTML = '❌';
+        return false;
+      }
+    }
+
+    // 并发测速
+    async function runSpeedTest() {
+      if (isTesting) return;
+      isTesting = true;
+      document.getElementById('startBtn').disabled = true;
+      let ok = 0, fail = 0;
+      let cursor = 0;
+
+      async function worker() {
+        while (cursor < sourcesList.length) {
+          const idx = cursor++;
+          const success = await testSingle(sourcesList[idx], idx);
+          if (success) ok++; else fail++;
+          document.getElementById('okCount').innerText = ok;
+          document.getElementById('failCount').innerText = fail;
+        }
+      }
+
+      await Promise.all(Array.from({ length: 4 }, worker));
+      isTesting = false;
+      document.getElementById('startBtn').disabled = false;
+    }
+
+    // 禁用失效源
+    function disableFailedSources() {
+      sourcesList.forEach((item, index) => {
+        const searchEl = document.getElementById('search-' + index);
+        if (searchEl && searchEl.innerText.includes('❌')) {
+          const key = String(item.key || item.name || item.api);
+          disabledSet.add(key);
+        }
+      });
+      renderTable();
+    }
+
+    // 重置恢复全部
+    async function resetSources() {
+      if (!confirm('确定要清空所有禁用状态，恢复所有源吗？')) return;
+      const source = document.getElementById('sourceSelect').value;
+      try {
+        await fetch('/api/manage/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source })
+        });
+        disabledSet.clear();
+        await onSourceChange();
+        alert('已成功重置！所有源已恢复启用。');
+      } catch (e) {
+        alert('重置失败: ' + e.message);
+      }
+    }
+
+    // 保存状态到 KV
+    async function saveState() {
+      const source = document.getElementById('sourceSelect').value;
+      const btn = document.getElementById('saveBtn');
+      btn.innerText = '保存中...';
+      btn.disabled = true;
+
+      try {
+        const res = await fetch('/api/manage/save-disabled', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source: source,
+            disabled: Array.from(disabledSet)
+          })
+        });
+        const ret = await res.json();
+        if (ret.success) {
+          alert('配置已成功保存！播放器拉取订阅时已自动剔除禁用源。');
+        } else {
+          alert('保存失败: ' + (ret.error || 'KV 存储未配置'));
+        }
+      } catch (e) {
+        alert('请求失败: ' + e.message);
+      } finally {
+        btn.innerText = '💾 保存同步';
+        btn.disabled = false;
+      }
+    }
+
+    function copyText(text) {
+      navigator.clipboard.writeText(text).then(() => alert('已复制到剪贴板！'));
+    }
+
+    function escapeHtml(str) {
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // 首屏直接渲染预加载的源
+    renderTable();
+  </script>
+</body>
+</html>`
+
+  return new Response(html, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS }
+  })
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS_HEADERS }
+  })
+}
