@@ -45,10 +45,13 @@ const FORMAT_CONFIG = {
   'proxy-base58': { proxy: true, base58: true }
 }
 
-// 获取绑定的 KV 实例（兼容 KV 与 CONFIG_KV）
+// 获取绑定的 KV 实例（全面兼容 KV 与 LUNATV_KV）
 function getKV(env) {
-  if (env && env.KV && typeof env.KV.get === 'function') return env.KV
-  if (env && env.CONFIG_KV && typeof env.CONFIG_KV.get === 'function') return env.CONFIG_KV
+  if (env) {
+    if (env.KV && typeof env.KV.get === 'function') return env.KV
+    if (env.LUNATV_KV && typeof env.LUNATV_KV.get === 'function') return env.LUNATV_KV
+    if (env.CONFIG_KV && typeof env.CONFIG_KV.get === 'function') return env.CONFIG_KV
+  }
   if (typeof globalThis.KV !== 'undefined' && globalThis.KV && typeof globalThis.KV.get === 'function') return globalThis.KV
   return null
 }
@@ -83,7 +86,7 @@ function base58Encode(data) {
 // ================= 源列表智能解析 =================
 function extractSourceList(data) {
   if (!data) return []
-  // 兼容 LunaTV 标准的 api_site 对象
+  // 1. 适配 api_site 字典对象
   if (data.api_site && typeof data.api_site === 'object' && !Array.isArray(data.api_site)) {
     return Object.entries(data.api_site).map(([key, val]) => ({
       key: key,
@@ -92,43 +95,79 @@ function extractSourceList(data) {
       ...val
     }))
   }
-  // 兼容数组格式
-  if (Array.isArray(data)) return data
+  // 2. 适配 sites/video/sources/list 数组
   for (const k of ['sites', 'video', 'sources', 'list']) {
     if (Array.isArray(data[k])) return data[k]
+  }
+  // 3. 适配直接数组
+  if (Array.isArray(data)) return data
+  // 4. 适配直接以资源名为 key 的顶层字典
+  if (typeof data === 'object') {
+    const list = []
+    for (const [k, v] of Object.entries(data)) {
+      if (v && typeof v === 'object' && (v.api || v.name)) {
+        list.push({ key: k, name: v.name || k, api: v.api || '', ...v })
+      }
+    }
+    if (list.length > 0) return list
   }
   return []
 }
 
-// ================= 过滤禁用的源（拉取时不传给播放器） =================
+// ================= 彻底修复：全方位递归剔除已禁用源 =================
 function filterDisabled(data, disabledKeys = []) {
   if (!disabledKeys || disabledKeys.length === 0) return data
-  const disabledSet = new Set(disabledKeys.map(String))
+  const disabledSet = new Set(disabledKeys.map(k => String(k).trim().toLowerCase()))
 
-  // 针对 api_site 对象，直接从输出中剔除禁用的 key
-  if (data && data.api_site && typeof data.api_site === 'object' && !Array.isArray(data.api_site)) {
-    const copy = JSON.parse(JSON.stringify(data))
-    for (const [key, val] of Object.entries(copy.api_site)) {
-      const k = String(key)
-      const name = val && val.name ? String(val.name) : ''
-      const api = val && val.api ? String(val.api) : ''
-      if (disabledSet.has(k) || disabledSet.has(name) || disabledSet.has(api)) {
-        delete copy.api_site[key]
+  const isMatch = (item, objKey = '') => {
+    if (!item && !objKey) return false
+    const candidates = []
+    if (objKey) candidates.push(String(objKey).trim().toLowerCase())
+    if (typeof item === 'object' && item !== null) {
+      if (item.key) candidates.push(String(item.key).trim().toLowerCase())
+      if (item.name) candidates.push(String(item.name).trim().toLowerCase())
+      if (item.api) candidates.push(String(item.api).trim().toLowerCase())
+    } else if (typeof item === 'string') {
+      candidates.push(String(item).trim().toLowerCase())
+    }
+    return candidates.some(c => disabledSet.has(c))
+  }
+
+  const copy = JSON.parse(JSON.stringify(data))
+
+  // 1. 数组结构
+  if (Array.isArray(copy)) {
+    const filtered = copy.filter(item => !isMatch(item))
+    return filtered.length > 0 ? filtered : copy
+  }
+
+  // 2. 对象结构
+  if (typeof copy === 'object' && copy !== null) {
+    // 2.1 过滤 api_site 字典
+    if (copy.api_site && typeof copy.api_site === 'object' && !Array.isArray(copy.api_site)) {
+      for (const [k, v] of Object.entries(copy.api_site)) {
+        if (isMatch(v, k)) delete copy.api_site[k]
+      }
+    }
+
+    // 2.2 过滤 sites, video, list 等子数组
+    for (const listKey of ['sites', 'video', 'sources', 'source', 'list', 'data']) {
+      if (Array.isArray(copy[listKey])) {
+        copy[listKey] = copy[listKey].filter(item => !isMatch(item))
+      }
+    }
+
+    // 2.3 过滤顶层直接字典
+    for (const [k, v] of Object.entries(copy)) {
+      if (k === 'api_site' || Array.isArray(v)) continue
+      if (v && typeof v === 'object' && (v.api || v.name)) {
+        if (isMatch(v, k)) delete copy[k]
       }
     }
     return copy
   }
 
-  // 针对数组格式
-  if (Array.isArray(data)) {
-    const res = data.filter(item => {
-      const k = String(item.key || item.name || item.api)
-      return !disabledSet.has(k) && !disabledSet.has(item.name) && !disabledSet.has(item.api)
-    })
-    return res.length > 0 ? res : data
-  }
-
-  return data
+  return copy
 }
 
 // 递归替换 API 代理前缀
@@ -222,15 +261,18 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // 3. 保存禁用源列表到 KV
+  // 3. 保存禁用源列表到 KV（修复同步生效）
   if (reqUrl.pathname === '/api/manage/save-disabled' && request.method === 'POST') {
     const kv = getKV(env)
     if (!kv) return jsonResponse({ error: '未检测到绑定的 KV 空间' }, 400)
     try {
       const body = await request.json()
       const { source, disabled } = body
-      await kv.put(`DISABLED_${source || 'jingjian'}`, JSON.stringify(disabled || []))
-      return jsonResponse({ success: true })
+      const sourceKey = source || 'jingjian'
+      await kv.put(`DISABLED_${sourceKey}`, JSON.stringify(disabled || []))
+      // 同时清空旧缓存，保证订阅拉取时立即生效
+      await kv.delete(`CONFIG_CACHE_${sourceKey}`).catch(() => {})
+      return jsonResponse({ success: true, count: (disabled || []).length })
     } catch (e) {
       return jsonResponse({ error: e.message }, 500)
     }
@@ -248,7 +290,7 @@ async function handleRequest(request, env, ctx) {
     return jsonResponse({ success: true })
   }
 
-  // 5. 播放器订阅拉取（自动剔除禁用源）
+  // 5. 播放器订阅拉取（自动剔除禁用源 + 强制禁用 CDN 缓存）
   if (reqUrl.searchParams.has('format')) {
     const formatParam = reqUrl.searchParams.get('format')
     const sourceParam = reqUrl.searchParams.get('source') || 'full'
@@ -256,7 +298,7 @@ async function handleRequest(request, env, ctx) {
     return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env)
   }
 
-  // 6. 首页展示：图 6 经典功能 + 图 5 测速管理表格
+  // 6. 首页展示：保留图 6 经典功能 + 图 5 测速面板（平铺 3 个配置按钮）
   return handleHomePage(currentOrigin, defaultPrefix, env)
 }
 
@@ -267,7 +309,7 @@ async function handleProxyRequest(request, currentOrigin) {
   let rawTarget = request.url.slice(markerIdx + marker.length).trim()
   try { rawTarget = decodeURIComponent(rawTarget) } catch {}
 
-  // 自动修复播放器参数拼接中缺失的 '?'
+  // 自动修复播放器参数拼接缺失的 '?'
   const schemeIdx = rawTarget.indexOf('://')
   if (schemeIdx !== -1) {
     const pathAndQuery = rawTarget.slice(schemeIdx + 3)
@@ -321,7 +363,7 @@ async function handleProxyRequest(request, currentOrigin) {
   }
 }
 
-// ================= 生成订阅处理 =================
+// ================= 生成订阅处理（带无缓存头，杜绝旧缓存） =================
 async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env) {
   try {
     const config = FORMAT_CONFIG[formatParam]
@@ -339,18 +381,26 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
     }
 
     // 剔除禁用的源
-    data = filterDisabled(JSON.parse(JSON.stringify(data)), disabledKeys)
+    data = filterDisabled(data, disabledKeys)
 
     // 添加代理前缀
     const finalData = config.proxy ? addOrReplacePrefix(data, prefixParam || defaultPrefix) : data
 
+    // 关键：强制禁用浏览器和 CDN 缓存，保证播放器拉取时实时同步！
+    const noCacheHeaders = {
+      ...CORS_HEADERS,
+      'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    }
+
     if (config.base58) {
       return new Response(base58Encode(finalData), {
-        headers: { 'Content-Type': 'text/plain; charset=UTF-8', ...CORS_HEADERS },
+        headers: { 'Content-Type': 'text/plain; charset=UTF-8', ...noCacheHeaders },
       })
     } else {
       return new Response(JSON.stringify(finalData), {
-        headers: { 'Content-Type': 'application/json; charset=UTF-8', ...CORS_HEADERS },
+        headers: { 'Content-Type': 'application/json; charset=UTF-8', ...noCacheHeaders },
       })
     }
   } catch (err) {
@@ -360,7 +410,6 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
 
 // ================= 完整前端页面 UI =================
 async function handleHomePage(origin, defaultPrefix, env) {
-  // 服务端预载精简+成人版（默认），首屏直接输出源数据
   let initialList = []
   let initialDisabled = []
   try {
@@ -398,7 +447,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
     .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
     .card-title { font-weight: bold; margin-bottom: 10px; font-size: 14px; color: #fff; }
 
-    /* 代码框与中转链接展示（图6样式） */
     pre { background: #15181e; color: #e2e8f0; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--border); font-size: 13px; overflow-x: auto; margin: 0; word-break: break-all; }
     .link-row { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; background: #15181e; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--border); gap: 8px; }
     .link-content { font-size: 13px; color: #cbd5e1; word-break: break-all; }
@@ -406,9 +454,29 @@ async function handleHomePage(origin, defaultPrefix, env) {
     .btn-copy { background: #0070f3; color: #fff; border: none; padding: 5px 12px; border-radius: 5px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
     .btn-copy:hover { opacity: 0.88; }
 
-    /* 图5 测速控制区 */
-    .select-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 14px; }
-    select { background: #15181e; color: #fff; border: 1px solid var(--border); padding: 6px 10px; border-radius: 6px; font-size: 13px; outline: none; }
+    /* 3个配置直接平铺排列，不折叠 */
+    .config-tabs-container { margin-bottom: 14px; }
+    .config-tabs-label { font-size: 13px; color: var(--text-muted); margin-bottom: 6px; display: block; }
+    .config-tabs-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .config-tab-btn {
+      background: #15181e;
+      color: #94a3b8;
+      border: 1px solid var(--border);
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .config-tab-btn:hover { color: #fff; border-color: #475569; }
+    .config-tab-btn.active {
+      background: #0070f3;
+      color: #fff;
+      border-color: #0070f3;
+      font-weight: 500;
+    }
+
+    /* 操作按钮 */
     .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
     .btn-action { border: none; padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; color: #fff; }
     .btn-blue { background: #0070f3; }
@@ -417,11 +485,9 @@ async function handleHomePage(origin, defaultPrefix, env) {
     .btn-green { background: var(--success); }
     .btn-action:disabled { opacity: 0.5; cursor: not-allowed; }
 
-    /* 统计状态条 */
     .stats-bar { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; padding: 2px 0; }
     .stats-bar span { font-weight: bold; color: #fff; margin: 0 3px; }
 
-    /* 测速表格 */
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border: 1px solid var(--border); padding: 10px 8px; text-align: left; }
     th { background: #161a20; color: #94a3b8; font-weight: 500; }
@@ -430,7 +496,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
     a.link-btn { color: var(--primary); text-decoration: none; }
     a.link-btn:hover { text-decoration: underline; }
 
-    /* 启用开关 */
     .switch { position: relative; display: inline-block; width: 38px; height: 20px; }
     .switch input { opacity: 0; width: 0; height: 0; }
     .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #4b5563; transition: .2s; border-radius: 20px; }
@@ -444,13 +509,11 @@ async function handleHomePage(origin, defaultPrefix, env) {
   <h1>⚡ CORSAPI（API 代理 & JSON 订阅器）</h1>
   <div class="subtitle">基于 Cloudflare Workers 的中转代理，支持自动注入代理前缀并生成 Base58 格式订阅。</div>
 
-  <!-- 图6 功能1：通用 API 中转代理 -->
   <h2>1. 通用 API 中转代理</h2>
   <div style="position: relative;">
     <pre id="generalProxy">${defaultPrefix}https://ikunzyapi.com/api.php/provide/vod/</pre>
   </div>
 
-  <!-- 图6 功能2：订阅链接生成（三大版本完整保留） -->
   <h2>2. 订阅链接生成</h2>
 
   <div class="card">
@@ -489,16 +552,16 @@ async function handleHomePage(origin, defaultPrefix, env) {
     </div>
   </div>
 
-  <!-- 图5 功能：资源源测速与可用性管理 -->
   <h2>📊 资源源测速与可用性管理</h2>
   <div class="card">
-    <div class="select-row">
-      <label>选择配置：</label>
-      <select id="sourceSelect" onchange="onSourceChange()">
-        <option value="jingjian" selected>精简+成人版 (推荐)</option>
-        <option value="jin18">精简版</option>
-        <option value="full">完整版</option>
-      </select>
+    <!-- 3个直接平铺排列，不折叠 -->
+    <div class="config-tabs-container">
+      <span class="config-tabs-label">选择配置：</span>
+      <div class="config-tabs-row">
+        <button type="button" class="config-tab-btn active" id="tab-jingjian" onclick="switchSource('jingjian')">精简+成人版 (推荐)</button>
+        <button type="button" class="config-tab-btn" id="tab-jin18" onclick="switchSource('jin18')">精简版</button>
+        <button type="button" class="config-tab-btn" id="tab-full" onclick="switchSource('full')">完整版</button>
+      </div>
     </div>
 
     <div class="btn-group">
@@ -534,6 +597,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
   <script>
     const ORIGIN = '${origin}';
+    let currentSource = 'jingjian';
     let sourcesList = ${JSON.stringify(initialList)};
     let disabledSet = new Set(${JSON.stringify(initialDisabled)});
     let isTesting = false;
@@ -571,14 +635,21 @@ async function handleHomePage(origin, defaultPrefix, env) {
       document.getElementById('disabledCount').innerText = disabledNum;
     }
 
-    // 下拉框切换
-    async function onSourceChange() {
-      const source = document.getElementById('sourceSelect').value;
+    // 平铺选项直接切换
+    async function switchSource(sourceKey) {
+      if (currentSource === sourceKey && sourcesList.length > 0) return;
+      currentSource = sourceKey;
+
+      // 更新按钮高亮
+      document.querySelectorAll('.config-tab-btn').forEach(btn => btn.classList.remove('active'));
+      const activeBtn = document.getElementById('tab-' + sourceKey);
+      if (activeBtn) activeBtn.classList.add('active');
+
       const tbody = document.getElementById('tableBody');
       tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px; color:var(--text-muted);">正在拉取资源列表...</td></tr>';
       
       try {
-        const res = await fetch('/api/manage/sources?source=' + source);
+        const res = await fetch('/api/manage/sources?source=' + sourceKey);
         const data = await res.json();
         if (data.error) throw new Error(data.error);
 
@@ -621,7 +692,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const json = await res.json();
         
-        // 校验是否有有效电影列表或规范响应
         const hasList = (json && (Array.isArray(json.list) && json.list.length > 0)) || json.code === 1 || json.page !== undefined;
 
         speedEl.innerText = latency + 'ms';
@@ -681,16 +751,15 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
     // 重置恢复全部
     async function resetSources() {
-      if (!confirm('确定要清空所有禁用状态，恢复所有源吗？')) return;
-      const source = document.getElementById('sourceSelect').value;
+      if (!confirm('确定要清空当前所有禁用状态，恢复所有源吗？')) return;
       try {
         await fetch('/api/manage/reset', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ source })
+          body: JSON.stringify({ source: currentSource })
         });
         disabledSet.clear();
-        await onSourceChange();
+        await switchSource(currentSource);
         alert('已成功重置！所有源已恢复启用。');
       } catch (e) {
         alert('重置失败: ' + e.message);
@@ -699,7 +768,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
     // 保存状态到 KV
     async function saveState() {
-      const source = document.getElementById('sourceSelect').value;
       const btn = document.getElementById('saveBtn');
       btn.innerText = '保存中...';
       btn.disabled = true;
@@ -709,18 +777,18 @@ async function handleHomePage(origin, defaultPrefix, env) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            source: source,
+            source: currentSource,
             disabled: Array.from(disabledSet)
           })
         });
         const ret = await res.json();
         if (ret.success) {
-          alert('配置已成功保存！播放器拉取订阅时已自动剔除禁用源。');
+          alert('✅ 配置已保存成功！已持久化并过滤 ' + ret.count + ' 个禁用源，播放器拉取时已自动剔除不同步。');
         } else {
           alert('保存失败: ' + (ret.error || 'KV 存储未配置'));
         }
       } catch (e) {
-        alert('保存失败: ' + e.message);
+        alert('保存请求失败: ' + e.message);
       } finally {
         btn.innerText = '💾 保存同步';
         btn.disabled = false;
@@ -751,7 +819,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
-    // 首屏直接渲染预加载的源
     renderTable();
   </script>
 </body>
