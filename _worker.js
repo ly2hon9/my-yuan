@@ -1,16 +1,11 @@
 // 统一入口：兼容 Cloudflare Workers 和 Pages Functions
 export default {
   async fetch(request, env, ctx) {
-    // Pages Functions 中 KV 需要从 env 中获取
-    if (env && env.KV && typeof globalThis.KV === 'undefined') {
-      globalThis.KV = env.KV
-    }
-    
-    return handleRequest(request)
+    return handleRequest(request, env, ctx)
   }
 }
 
-// 常量配置（避免重复创建）
+// 常量配置
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -18,7 +13,7 @@ const CORS_HEADERS = {
   'Access-Control-Max-Age': '86400',
 }
 
-const EXCLUDE_HEADERS = new Set([
+const EXCLUDE_RESPONSE_HEADERS = new Set([
   'content-encoding', 'content-length', 'transfer-encoding',
   'connection', 'keep-alive', 'set-cookie', 'set-cookie2'
 ])
@@ -40,38 +35,50 @@ const FORMAT_CONFIG = {
   'proxy-base58': { proxy: true, base58: true }
 }
 
-// Base58 编码函数
-const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+// 高性能 Base58 编码（基于 Uint8Array 数组运算，避免超大 BigInt 耗尽 Worker CPU）
+const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+const ALPHABET_MAP = new Uint8Array(256)
+for (let i = 0; i < ALPHABET.length; i++) {
+  ALPHABET_MAP[ALPHABET.charCodeAt(i)] = i
+}
+
 function base58Encode(obj) {
-  const str = JSON.stringify(obj)
-  const bytes = new TextEncoder().encode(str)
+  const str = typeof obj === 'string' ? obj : JSON.stringify(obj)
+  const source = new TextEncoder().encode(str)
+  if (source.length === 0) return ''
 
-  let intVal = 0n
-  for (let b of bytes) {
-    intVal = (intVal << 8n) + BigInt(b)
+  const digits = [0]
+  for (let i = 0; i < source.length; i++) {
+    let carry = source[i]
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8
+      digits[j] = carry % 58
+      carry = (carry / 58) | 0
+    }
+    while (carry > 0) {
+      digits.push(carry % 58)
+      carry = (carry / 58) | 0
+    }
   }
 
-  let result = ''
-  while (intVal > 0n) {
-    const mod = intVal % 58n
-    result = BASE58_ALPHABET[Number(mod)] + result
-    intVal = intVal / 58n
+  let output = ''
+  // 处理前导 0 字节对应 Base58 中的 '1'
+  for (let i = 0; i < source.length && source[i] === 0; i++) {
+    output += '1'
   }
-
-  for (let b of bytes) {
-    if (b === 0) result = BASE58_ALPHABET[0] + result
-    else break
+  for (let i = digits.length - 1; i >= 0; i--) {
+    output += ALPHABET[digits[i]]
   }
-
-  return result
+  return output
 }
 
 // JSON api 字段前缀替换
 function addOrReplacePrefix(obj, newPrefix) {
   if (typeof obj !== 'object' || obj === null) return obj
   if (Array.isArray(obj)) return obj.map(item => addOrReplacePrefix(item, newPrefix))
+  
   const newObj = {}
-  for (const key in obj) {
+  for (const key of Object.keys(obj)) {
     if (key === 'api' && typeof obj[key] === 'string') {
       let apiUrl = obj[key]
       const urlIndex = apiUrl.indexOf('?url=')
@@ -85,44 +92,58 @@ function addOrReplacePrefix(obj, newPrefix) {
   return newObj
 }
 
-// ---------- 安全版：KV 缓存 ----------
-async function getCachedJSON(url) {
-  const kvAvailable = typeof KV !== 'undefined' && KV && typeof KV.get === 'function'
+// 安全读取/写入 KV 缓存
+async function getCachedJSON(url, env) {
+  const kv = env && env.KV
+  const cacheKey = 'CACHE_' + url
 
-  if (kvAvailable) {
-    const cacheKey = 'CACHE_' + url
-    const cached = await KV.get(cacheKey)
+  if (kv && typeof kv.get === 'function') {
+    const cached = await kv.get(cacheKey)
     if (cached) {
       try {
         return JSON.parse(cached)
       } catch (e) {
-        await KV.delete(cacheKey)
+        await kv.delete(cacheKey)
       }
     }
     const res = await fetch(url)
     if (!res.ok) throw new Error(`Fetch failed: ${res.status}`)
     const data = await res.json()
-    await KV.put(cacheKey, JSON.stringify(data), { expirationTtl: 1800 })   // 缓存十分钟
+    // 缓存 30 分钟 (1800 秒)
+    await kv.put(cacheKey, JSON.stringify(data), { expirationTtl: 1800 })
     return data
-  } else {
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`Fetch failed: ${res.status}`)
-    return await res.json()
   }
+
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`Fetch failed: ${res.status}`)
+  return await res.json()
 }
 
-// ---------- 安全版：错误日志 ----------
-async function logError(type, info) {
-  // 保留错误输出，便于调试
-  console.error('[ERROR]', type, info)
+// SSRF 安全校验：阻止访问回环和局域网 IP
+function isBlockedTarget(hostname) {
+  const lower = hostname.toLowerCase()
+  if (
+    lower === 'localhost' ||
+    lower.endsWith('.local') ||
+    lower.endsWith('.internal') ||
+    lower === '0.0.0.0'
+  ) return true
 
-  // 禁止写入 KV
-  return
+  // 检查私有 IPv4
+  const ipv4Match = lower.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (ipv4Match) {
+    const [_, a, b] = ipv4Match.map(Number)
+    if (a === 127) return true // 回环地址
+    if (a === 10) return true  // 10.0.0.0/8
+    if (a === 172 && b >= 16 && b <= 31) return true // 172.16.0.0/12
+    if (a === 192 && b === 168) return true // 192.168.0.0/16
+    if (a === 169 && b === 254) return true // 链路本地地址 / AWS 元数据
+  }
+  return false
 }
 
-// ---------- 主逻辑 ----------
-async function handleRequest(request) {
-  // 快速处理 OPTIONS 请求
+// 主请求调度
+async function handleRequest(request, env, ctx) {
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS })
   }
@@ -137,56 +158,76 @@ async function handleRequest(request) {
   const currentOrigin = reqUrl.origin
   const defaultPrefix = currentOrigin + '/?url='
 
-  // 🩺 健康检查（最常见的性能检查，提前处理）
+  // 健康检查
   if (pathname === '/health') {
     return new Response('OK', { status: 200, headers: CORS_HEADERS })
   }
 
-  // 通用代理请求处理
+  // 通用反代请求处理
   if (targetUrlParam) {
     return handleProxyRequest(request, targetUrlParam, currentOrigin)
   }
 
-  // JSON 格式输出处理
+  // 格式转换与订阅处理
   if (formatParam !== null) {
-    return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix)
+    return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env)
   }
 
-  // 返回首页文档
+  // 首页展示
   return handleHomePage(currentOrigin, defaultPrefix)
 }
 
-// ---------- 代理请求处理子模块 ----------
+// 代理请求转发模块
 async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
-  // 🚨 防止递归调用自身
+  // 防止自身死循环
   if (targetUrlParam.startsWith(currentOrigin)) {
     return errorResponse('Loop detected: self-fetch blocked', { url: targetUrlParam }, 400)
   }
 
-  // 🚨 防止无效 URL
-  if (!/^https?:\/\//i.test(targetUrlParam)) {
-    return errorResponse('Invalid target URL', { url: targetUrlParam }, 400)
-  }
-
+  // 提取真实目标 URL（兼容客户端未对 targetUrl 内部参数做整体编码的情况）
   let fullTargetUrl = targetUrlParam
-  const urlMatch = request.url.match(/[?&]url=([^&]+(?:&.*)?)/)
-  if (urlMatch) fullTargetUrl = decodeURIComponent(urlMatch[1])
+  const rawUrl = request.url
+  const marker = '?url='
+  const markerIndex = rawUrl.indexOf(marker)
+  if (markerIndex !== -1) {
+    fullTargetUrl = rawUrl.slice(markerIndex + marker.length)
+    try {
+      fullTargetUrl = decodeURIComponent(fullTargetUrl)
+    } catch {
+      // 保持原样
+    }
+  }
 
   let targetURL
   try {
     targetURL = new URL(fullTargetUrl)
   } catch {
-    await logError('proxy', { message: 'Invalid URL', url: fullTargetUrl })
-    return errorResponse('Invalid URL', { url: fullTargetUrl }, 400)
+    return errorResponse('Invalid URL format', { url: fullTargetUrl }, 400)
+  }
+
+  // 安全检查：屏蔽内网及私有地址探测 (SSRF)
+  if (isBlockedTarget(targetURL.hostname)) {
+    return errorResponse('Access to private/local network is forbidden', { target: targetURL.hostname }, 403)
   }
 
   try {
+    // 过滤发往目标服务器的 Headers，删除原有的 Host 和 CDN 内部标记
+    const forwardedHeaders = new Headers(request.headers)
+    forwardedHeaders.delete('host')
+    forwardedHeaders.delete('cf-connecting-ip')
+    forwardedHeaders.delete('cf-ray')
+    forwardedHeaders.delete('cf-ipcountry')
+    forwardedHeaders.delete('cf-visitor')
+    forwardedHeaders.delete('x-real-ip')
+    forwardedHeaders.delete('x-forwarded-for')
+
     const proxyRequest = new Request(targetURL.toString(), {
       method: request.method,
-      headers: request.headers,
+      headers: forwardedHeaders,
       body: request.method !== 'GET' && request.method !== 'HEAD'
         ? await request.arrayBuffer()
         : undefined,
+      redirect: 'follow'
     })
 
     const controller = new AbortController()
@@ -196,7 +237,7 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
 
     const responseHeaders = new Headers(CORS_HEADERS)
     for (const [key, value] of response.headers) {
-      if (!EXCLUDE_HEADERS.has(key.toLowerCase())) {
+      if (!EXCLUDE_RESPONSE_HEADERS.has(key.toLowerCase())) {
         responseHeaders.set(key, value)
       }
     }
@@ -207,7 +248,7 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
       headers: responseHeaders
     })
   } catch (err) {
-    await logError('proxy', { message: err.message || '代理请求失败', url: fullTargetUrl })
+    console.error('[PROXY_ERROR]', err.message, fullTargetUrl)
     return errorResponse('Proxy Error', {
       message: err.message || '代理请求失败',
       target: fullTargetUrl,
@@ -216,8 +257,8 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
   }
 }
 
-// ---------- JSON 格式输出处理子模块 ----------
-async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix) {
+// 订阅源格式处理模块
+async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env) {
   try {
     const config = FORMAT_CONFIG[formatParam]
     if (!config) {
@@ -225,7 +266,7 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
     }
 
     const selectedSource = JSON_SOURCES[sourceParam] || JSON_SOURCES['full']
-    const data = await getCachedJSON(selectedSource)
+    const data = await getCachedJSON(selectedSource, env)
     
     const newData = config.proxy
       ? addOrReplacePrefix(data, prefixParam || defaultPrefix)
@@ -234,20 +275,20 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
     if (config.base58) {
       const encoded = base58Encode(newData)
       return new Response(encoded, {
-        headers: { 'Content-Type': 'text/plain;charset=UTF-8', ...CORS_HEADERS },
+        headers: { 'Content-Type': 'text/plain; charset=UTF-8', ...CORS_HEADERS },
       })
     } else {
       return new Response(JSON.stringify(newData), {
-        headers: { 'Content-Type': 'application/json;charset=UTF-8', ...CORS_HEADERS },
+        headers: { 'Content-Type': 'application/json; charset=UTF-8', ...CORS_HEADERS },
       })
     }
   } catch (err) {
-    await logError('json', { message: err.message })
+    console.error('[JSON_ERROR]', err.message)
     return errorResponse(err.message, {}, 500)
   }
 }
 
-// ---------- 首页文档处理 ----------
+// 首页使用文档 HTML
 async function handleHomePage(currentOrigin, defaultPrefix) {
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -261,20 +302,20 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
     h2 { color: #555; margin-top: 30px; }
     code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 14px; }
     pre { background: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; }
-    .example { background: #e8f5e9; padding: 15px; border-left: 4px solid #4caf50; margin: 20px 0; }
     .section { background: #f9f9f9; padding: 15px; border-radius: 5px; margin: 15px 0; }
     table { width: 100%; border-collapse: collapse; margin: 15px 0; }
     table td { padding: 8px; border: 1px solid #ddd; }
     table td:first-child { background: #f5f5f5; font-weight: bold; width: 30%; }
+    .copy-btn { margin-left: 8px; cursor: pointer; padding: 2px 8px; font-size: 12px; }
   </style>
 </head>
 <body>
   <h1>🔄 API 中转代理服务</h1>
-  <p>通用 API 中转代理，用于访问被墙或限制的接口。</p>
+  <p>通用 API 中转代理，用于跨域中转与配置聚合。</p>
   
   <h2>使用方法</h2>
   <p>中转任意 API：在请求 URL 后添加 <code>?url=目标地址</code> 参数</p>
-  <pre>${defaultPrefix}<示例API地址></pre>
+  <pre>${defaultPrefix}&lt;示例API地址&gt;</pre>
   
   <h2>配置订阅参数说明</h2>
   <div class="section">
@@ -303,38 +344,27 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
     
   <div class="section">
     <h3>📦 精简版（jin18）</h3>
-    <p>原始 JSON：<br><code class="copyable">${currentOrigin}?format=0&source=jin18</code> <button class="copy-btn">复制</button></p>
-    <p>中转代理 JSON：<br><code class="copyable">${currentOrigin}?format=1&source=jin18</code> <button class="copy-btn">复制</button></p>
-    <p>原始 Base58：<br><code class="copyable">${currentOrigin}?format=2&source=jin18</code> <button class="copy-btn">复制</button></p>
-    <p>中转 Base58：<br><code class="copyable">${currentOrigin}?format=3&source=jin18</code> <button class="copy-btn">复制</button></p>
+    <p>原始 JSON：<code class="copyable">${currentOrigin}?format=0&source=jin18</code> <button class="copy-btn">复制</button></p>
+    <p>中转代理 JSON：<code class="copyable">${currentOrigin}?format=1&source=jin18</code> <button class="copy-btn">复制</button></p>
+    <p>原始 Base58：<code class="copyable">${currentOrigin}?format=2&source=jin18</code> <button class="copy-btn">复制</button></p>
+    <p>中转 Base58：<code class="copyable">${currentOrigin}?format=3&source=jin18</code> <button class="copy-btn">复制</button></p>
   </div>
   
   <div class="section">
     <h3>📦 精简版+成人（jingjian）</h3>
-    <p>原始 JSON：<br><code class="copyable">${currentOrigin}?format=0&source=jingjian</code> <button class="copy-btn">复制</button></p>
-    <p>中转代理 JSON：<br><code class="copyable">${currentOrigin}?format=1&source=jingjian</code> <button class="copy-btn">复制</button></p>
-    <p>原始 Base58：<br><code class="copyable">${currentOrigin}?format=2&source=jingjian</code> <button class="copy-btn">复制</button></p>
-    <p>中转 Base58：<br><code class="copyable">${currentOrigin}?format=3&source=jingjian</code> <button class="copy-btn">复制</button></p>
+    <p>原始 JSON：<code class="copyable">${currentOrigin}?format=0&source=jingjian</code> <button class="copy-btn">复制</button></p>
+    <p>中转代理 JSON：<code class="copyable">${currentOrigin}?format=1&source=jingjian</code> <button class="copy-btn">复制</button></p>
+    <p>原始 Base58：<code class="copyable">${currentOrigin}?format=2&source=jingjian</code> <button class="copy-btn">复制</button></p>
+    <p>中转 Base58：<code class="copyable">${currentOrigin}?format=3&source=jingjian</code> <button class="copy-btn">复制</button></p>
   </div>
   
   <div class="section">
     <h3>📦 完整版（full，默认）</h3>
-    <p>原始 JSON：<br><code class="copyable">${currentOrigin}?format=0&source=full</code> <button class="copy-btn">复制</button></p>
-    <p>中转代理 JSON：<br><code class="copyable">${currentOrigin}?format=1&source=full</code> <button class="copy-btn">复制</button></p>
-    <p>原始 Base58：<br><code class="copyable">${currentOrigin}?format=2&source=full</code> <button class="copy-btn">复制</button></p>
-    <p>中转 Base58：<br><code class="copyable">${currentOrigin}?format=3&source=full</code> <button class="copy-btn">复制</button></p>
+    <p>原始 JSON：<code class="copyable">${currentOrigin}?format=0&source=full</code> <button class="copy-btn">复制</button></p>
+    <p>中转代理 JSON：<code class="copyable">${currentOrigin}?format=1&source=full</code> <button class="copy-btn">复制</button></p>
+    <p>原始 Base58：<code class="copyable">${currentOrigin}?format=2&source=full</code> <button class="copy-btn">复制</button></p>
+    <p>中转 Base58：<code class="copyable">${currentOrigin}?format=3&source=full</code> <button class="copy-btn">复制</button></p>
   </div>
-  
-  <h2>支持的功能</h2>
-  <ul>
-    <li>✅ 支持 GET、POST、PUT、DELETE 等所有 HTTP 方法</li>
-    <li>✅ 自动转发请求头和请求体</li>
-    <li>✅ 保留原始响应头（除敏感信息）</li>
-    <li>✅ 完整的 CORS 支持</li>
-    <li>✅ 超时保护（9 秒）</li>
-    <li>✅ 支持多种配置源切换</li>
-    <li>✅ 支持 Base58 编码输出</li>
-  </ul>
   
   <script>
     document.querySelectorAll('.copy-btn').forEach((btn, idx) => {
@@ -356,7 +386,7 @@ async function handleHomePage(currentOrigin, defaultPrefix) {
   })
 }
 
-// ---------- 统一错误响应处理 ----------
+// 统一错误输出
 function errorResponse(error, data = {}, status = 400) {
   return new Response(JSON.stringify({ error, ...data }), {
     status,
