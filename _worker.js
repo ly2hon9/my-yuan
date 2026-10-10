@@ -5,7 +5,7 @@ export default {
   }
 }
 
-// ================= 全局配置 =================
+// ================= 常量配置 =================
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -45,7 +45,7 @@ const FORMAT_CONFIG = {
   'proxy-base58': { proxy: true, base58: true }
 }
 
-// 获取绑定的 KV 实例（适配截图中的 KV 命名）
+// 获取绑定的 KV 实例（兼容 KV 与 CONFIG_KV）
 function getKV(env) {
   if (env && env.KV && typeof env.KV.get === 'function') return env.KV
   if (env && env.CONFIG_KV && typeof env.CONFIG_KV.get === 'function') return env.CONFIG_KV
@@ -80,10 +80,10 @@ function base58Encode(data) {
   return output
 }
 
-// ================= LunaTV 源数据智能提取 =================
+// ================= 源列表智能解析 =================
 function extractSourceList(data) {
   if (!data) return []
-  // 1. 核心适配：LunaTV 标准的 api_site 字典对象
+  // 兼容 LunaTV 标准的 api_site 对象
   if (data.api_site && typeof data.api_site === 'object' && !Array.isArray(data.api_site)) {
     return Object.entries(data.api_site).map(([key, val]) => ({
       key: key,
@@ -92,7 +92,7 @@ function extractSourceList(data) {
       ...val
     }))
   }
-  // 2. 兼容数组格式
+  // 兼容数组格式
   if (Array.isArray(data)) return data
   for (const k of ['sites', 'video', 'sources', 'list']) {
     if (Array.isArray(data[k])) return data[k]
@@ -100,7 +100,7 @@ function extractSourceList(data) {
   return []
 }
 
-// ================= 过滤禁用源（拉取时不传给播放器） =================
+// ================= 过滤禁用的源（拉取时不传给播放器） =================
 function filterDisabled(data, disabledKeys = []) {
   if (!disabledKeys || disabledKeys.length === 0) return data
   const disabledSet = new Set(disabledKeys.map(String))
@@ -183,7 +183,7 @@ async function fetchConfig(sourceKey, env, forceRefresh = false) {
       }
     } catch {}
   }
-  throw new Error('无法连接配置源，请稍后重试')
+  throw new Error('无法连接配置源，请检查网络')
 }
 
 // ================= 主请求路由 =================
@@ -225,7 +225,7 @@ async function handleRequest(request, env, ctx) {
   // 3. 保存禁用源列表到 KV
   if (reqUrl.pathname === '/api/manage/save-disabled' && request.method === 'POST') {
     const kv = getKV(env)
-    if (!kv) return jsonResponse({ error: '未检测到绑定的 KV 空间，请检查设置并重新部署' }, 400)
+    if (!kv) return jsonResponse({ error: '未检测到绑定的 KV 空间' }, 400)
     try {
       const body = await request.json()
       const { source, disabled } = body
@@ -256,8 +256,8 @@ async function handleRequest(request, env, ctx) {
     return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env)
   }
 
-  // 6. 首页展示（图 2 原版设计）
-  return handleHomePage(currentOrigin, env)
+  // 6. 首页展示：图 6 经典功能 + 图 5 测速管理表格
+  return handleHomePage(currentOrigin, defaultPrefix, env)
 }
 
 // ================= API 反代核心 =================
@@ -358,8 +358,8 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
   }
 }
 
-// ================= 图2 原版页面 UI =================
-async function handleHomePage(origin, env) {
+// ================= 完整前端页面 UI =================
+async function handleHomePage(origin, defaultPrefix, env) {
   // 服务端预载精简+成人版（默认），首屏直接输出源数据
   let initialList = []
   let initialDisabled = []
@@ -378,7 +378,7 @@ async function handleHomePage(origin, env) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>订阅配置与测速管理</title>
+  <title>CORSAPI（API 代理 & JSON 订阅器）</title>
   <style>
     :root {
       --bg: #121417;
@@ -392,20 +392,23 @@ async function handleHomePage(origin, env) {
       --success: #17bf63;
     }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 820px; margin: 25px auto; padding: 0 14px; background: var(--bg); color: var(--text); line-height: 1.5; }
-    h2 { font-size: 19px; color: #fff; margin: 18px 0 10px; display: flex; align-items: center; gap: 6px; }
-    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 20px; }
-    
-    /* 顶部订阅链接条（图2风格） */
-    .link-box { display: flex; align-items: center; justify-content: space-between; margin: 10px 0; background: #15181e; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); gap: 8px; }
-    .link-text { font-size: 13px; color: #cbd5e1; word-break: break-all; }
-    .link-text code { font-family: monospace; color: var(--warning); background: rgba(255, 173, 31, 0.1); padding: 2px 5px; border-radius: 4px; }
-    .btn-copy { background: #0070f3; color: #fff; border: none; padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
-    .btn-copy:hover { opacity: 0.9; }
+    h1 { font-size: 20px; color: #fff; margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+    .subtitle { color: var(--text-muted); font-size: 13px; margin-bottom: 20px; }
+    h2 { font-size: 17px; color: #fff; margin: 24px 0 10px; display: flex; align-items: center; gap: 6px; }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+    .card-title { font-weight: bold; margin-bottom: 10px; font-size: 14px; color: #fff; }
 
-    /* 控制栏与操作按钮（图2原版） */
+    /* 代码框与中转链接展示（图6样式） */
+    pre { background: #15181e; color: #e2e8f0; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--border); font-size: 13px; overflow-x: auto; margin: 0; word-break: break-all; }
+    .link-row { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; background: #15181e; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--border); gap: 8px; }
+    .link-content { font-size: 13px; color: #cbd5e1; word-break: break-all; }
+    code { font-family: monospace; color: var(--warning); background: rgba(255, 173, 31, 0.1); padding: 2px 5px; border-radius: 4px; font-size: 12.5px; }
+    .btn-copy { background: #0070f3; color: #fff; border: none; padding: 5px 12px; border-radius: 5px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+    .btn-copy:hover { opacity: 0.88; }
+
+    /* 图5 测速控制区 */
     .select-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 14px; }
     select { background: #15181e; color: #fff; border: 1px solid var(--border); padding: 6px 10px; border-radius: 6px; font-size: 13px; outline: none; }
-    
     .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
     .btn-action { border: none; padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; color: #fff; }
     .btn-blue { background: #0070f3; }
@@ -414,11 +417,11 @@ async function handleHomePage(origin, env) {
     .btn-green { background: var(--success); }
     .btn-action:disabled { opacity: 0.5; cursor: not-allowed; }
 
-    /* 统计条（图2样式） */
-    .stats-bar { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; padding: 4px 0; }
+    /* 统计状态条 */
+    .stats-bar { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; padding: 2px 0; }
     .stats-bar span { font-weight: bold; color: #fff; margin: 0 3px; }
 
-    /* 表格结构（图2原版） */
+    /* 测速表格 */
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border: 1px solid var(--border); padding: 10px 8px; text-align: left; }
     th { background: #161a20; color: #94a3b8; font-weight: 500; }
@@ -427,7 +430,7 @@ async function handleHomePage(origin, env) {
     a.link-btn { color: var(--primary); text-decoration: none; }
     a.link-btn:hover { text-decoration: underline; }
 
-    /* 启用开关（iOS风格） */
+    /* 启用开关 */
     .switch { position: relative; display: inline-block; width: 38px; height: 20px; }
     .switch input { opacity: 0; width: 0; height: 0; }
     .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #4b5563; transition: .2s; border-radius: 20px; }
@@ -438,30 +441,63 @@ async function handleHomePage(origin, env) {
 </head>
 <body>
 
-  <h2>⚡ 订阅配置拉取</h2>
+  <h1>⚡ CORSAPI（API 代理 & JSON 订阅器）</h1>
+  <div class="subtitle">基于 Cloudflare Workers 的中转代理，支持自动注入代理前缀并生成 Base58 格式订阅。</div>
+
+  <!-- 图6 功能1：通用 API 中转代理 -->
+  <h2>1. 通用 API 中转代理</h2>
+  <div style="position: relative;">
+    <pre id="generalProxy">${defaultPrefix}https://ikunzyapi.com/api.php/provide/vod/</pre>
+  </div>
+
+  <!-- 图6 功能2：订阅链接生成（三大版本完整保留） -->
+  <h2>2. 订阅链接生成</h2>
+
   <div class="card">
-    <div class="link-box">
-      <div class="link-text">
-        📦 <span id="labelJson">精简+成人 (推荐)</span>：<code id="urlJson">${origin}/?format=1&source=jingjian</code>
-      </div>
-      <button class="btn-copy" onclick="copyText(document.getElementById('urlJson').innerText)">复制</button>
+    <div class="card-title">📦 精简版（31个精选资源）</div>
+    <div class="link-row">
+      <div class="link-content">中转 JSON：<code>${origin}/?format=1&source=jin18</code></div>
+      <button class="btn-copy" onclick="copyText('${origin}/?format=1&source=jin18')">复制</button>
     </div>
-    <div class="link-box">
-      <div class="link-text">
-        📦 <span id="labelB58">Base58 格式</span>：<code id="urlB58">${origin}/?format=3&source=jingjian</code>
-      </div>
-      <button class="btn-copy" onclick="copyText(document.getElementById('urlB58').innerText)">复制</button>
+    <div class="link-row">
+      <div class="link-content">中转 Base58：<code>${origin}/?format=3&source=jin18</code></div>
+      <button class="btn-copy" onclick="copyText('${origin}/?format=3&source=jin18')">复制</button>
     </div>
   </div>
 
+  <div class="card">
+    <div class="card-title">📦 精简 + 成人版（61个资源，推荐）</div>
+    <div class="link-row">
+      <div class="link-content">中转 JSON：<code>${origin}/?format=1&source=jingjian</code></div>
+      <button class="btn-copy" onclick="copyText('${origin}/?format=1&source=jingjian')">复制</button>
+    </div>
+    <div class="link-row">
+      <div class="link-content">中转 Base58：<code>${origin}/?format=3&source=jingjian</code></div>
+      <button class="btn-copy" onclick="copyText('${origin}/?format=3&source=jingjian')">复制</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📦 完整版（88个资源，默认）</div>
+    <div class="link-row">
+      <div class="link-content">中转 JSON：<code>${origin}/?format=1&source=full</code></div>
+      <button class="btn-copy" onclick="copyText('${origin}/?format=1&source=full')">复制</button>
+    </div>
+    <div class="link-row">
+      <div class="link-content">中转 Base58：<code>${origin}/?format=3&source=full</code></div>
+      <button class="btn-copy" onclick="copyText('${origin}/?format=3&source=full')">复制</button>
+    </div>
+  </div>
+
+  <!-- 图5 功能：资源源测速与可用性管理 -->
   <h2>📊 资源源测速与可用性管理</h2>
   <div class="card">
     <div class="select-row">
       <label>选择配置：</label>
       <select id="sourceSelect" onchange="onSourceChange()">
         <option value="jingjian" selected>精简+成人版 (推荐)</option>
-        <option value="jin18">精简版 (31个资源)</option>
-        <option value="full">完整版 (88个资源)</option>
+        <option value="jin18">精简版</option>
+        <option value="full">完整版</option>
       </select>
     </div>
 
@@ -535,13 +571,9 @@ async function handleHomePage(origin, env) {
       document.getElementById('disabledCount').innerText = disabledNum;
     }
 
-    // 下拉框联动
+    // 下拉框切换
     async function onSourceChange() {
       const source = document.getElementById('sourceSelect').value;
-      // 联动顶部订阅地址
-      document.getElementById('urlJson').innerText = \`\${ORIGIN}/?format=1&source=\${source}\`;
-      document.getElementById('urlB58').innerText = \`\${ORIGIN}/?format=3&source=\${source}\`;
-
       const tbody = document.getElementById('tableBody');
       tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px; color:var(--text-muted);">正在拉取资源列表...</td></tr>';
       
@@ -588,7 +620,9 @@ async function handleHomePage(origin, env) {
         const latency = Date.now() - startTime;
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const json = await res.json();
-        const hasList = (json && (Array.isArray(json.list) && json.list.length > 0)) || json.code === 1;
+        
+        // 校验是否有有效电影列表或规范响应
+        const hasList = (json && (Array.isArray(json.list) && json.list.length > 0)) || json.code === 1 || json.page !== undefined;
 
         speedEl.innerText = latency + 'ms';
         speedEl.style.color = latency < 1500 ? 'var(--success)' : 'var(--warning)';
@@ -686,7 +720,7 @@ async function handleHomePage(origin, env) {
           alert('保存失败: ' + (ret.error || 'KV 存储未配置'));
         }
       } catch (e) {
-        alert('请求失败: ' + e.message);
+        alert('保存失败: ' + e.message);
       } finally {
         btn.innerText = '💾 保存同步';
         btn.disabled = false;
@@ -694,7 +728,23 @@ async function handleHomePage(origin, env) {
     }
 
     function copyText(text) {
-      navigator.clipboard.writeText(text).then(() => alert('已复制到剪贴板！'));
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          alert('已复制到剪贴板！');
+        }).catch(() => promptFallback(text));
+      } else {
+        promptFallback(text);
+      }
+    }
+
+    function promptFallback(text) {
+      const input = document.createElement('textarea');
+      input.value = text;
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand('copy');
+      document.body.removeChild(input);
+      alert('已复制到剪贴板！');
     }
 
     function escapeHtml(str) {
