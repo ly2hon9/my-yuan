@@ -5,7 +5,7 @@ export default {
   }
 }
 
-// ================= 全局常量配置 =================
+// ================= 全局配置 =================
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -18,14 +18,22 @@ const EXCLUDE_RESPONSE_HEADERS = new Set([
   'connection', 'keep-alive', 'set-cookie', 'set-cookie2'
 ])
 
-// 订阅源 GitHub 地址映射
+// 容灾多线路源地址（GitHub + jsDelivr CDN）
 const JSON_SOURCES = {
-  'jin18': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jin18.json',
-  'jingjian': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jingjian.json',
-  'full': 'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/LunaTV-config.json'
+  'jin18': [
+    'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jin18.json',
+    'https://cdn.jsdelivr.net/gh/hafrey1/LunaTV-config@main/jin18.json'
+  ],
+  'jingjian': [
+    'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jingjian.json',
+    'https://cdn.jsdelivr.net/gh/hafrey1/LunaTV-config@main/jingjian.json'
+  ],
+  'full': [
+    'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/LunaTV-config.json',
+    'https://cdn.jsdelivr.net/gh/hafrey1/LunaTV-config@main/LunaTV-config.json'
+  ]
 }
 
-// 格式映射
 const FORMAT_CONFIG = {
   '0': { proxy: false, base58: false },
   'raw': { proxy: false, base58: false },
@@ -37,8 +45,15 @@ const FORMAT_CONFIG = {
   'proxy-base58': { proxy: true, base58: true }
 }
 
-// ================= 高性能 Base58 算法 =================
-// 采用 Uint8Array 局部进位算法，避免使用超大 BigInt 导致 Worker CPU 超过 50ms 限制
+// 获取绑定的 KV 实例（适配截图中的 KV 命名）
+function getKV(env) {
+  if (env && env.KV && typeof env.KV.get === 'function') return env.KV
+  if (env && env.CONFIG_KV && typeof env.CONFIG_KV.get === 'function') return env.CONFIG_KV
+  if (typeof globalThis.KV !== 'undefined' && globalThis.KV && typeof globalThis.KV.get === 'function') return globalThis.KV
+  return null
+}
+
+// ================= Base58 算法 =================
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 function base58Encode(data) {
   const str = typeof data === 'string' ? data : JSON.stringify(data)
@@ -60,17 +75,63 @@ function base58Encode(data) {
   }
 
   let output = ''
-  // 处理前导 0
-  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) {
-    output += '1'
-  }
-  for (let i = digits.length - 1; i >= 0; i--) {
-    output += BASE58_ALPHABET[digits[i]]
-  }
+  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) output += '1'
+  for (let i = digits.length - 1; i >= 0; i--) output += BASE58_ALPHABET[digits[i]]
   return output
 }
 
-// ================= 配置 JSON 前缀替换 =================
+// ================= LunaTV 源数据智能提取 =================
+function extractSourceList(data) {
+  if (!data) return []
+  // 1. 核心适配：LunaTV 标准的 api_site 字典对象
+  if (data.api_site && typeof data.api_site === 'object' && !Array.isArray(data.api_site)) {
+    return Object.entries(data.api_site).map(([key, val]) => ({
+      key: key,
+      name: (val && val.name) ? val.name : key,
+      api: (val && val.api) ? val.api : '',
+      ...val
+    }))
+  }
+  // 2. 兼容数组格式
+  if (Array.isArray(data)) return data
+  for (const k of ['sites', 'video', 'sources', 'list']) {
+    if (Array.isArray(data[k])) return data[k]
+  }
+  return []
+}
+
+// ================= 过滤禁用源（拉取时不传给播放器） =================
+function filterDisabled(data, disabledKeys = []) {
+  if (!disabledKeys || disabledKeys.length === 0) return data
+  const disabledSet = new Set(disabledKeys.map(String))
+
+  // 针对 api_site 对象，直接从输出中剔除禁用的 key
+  if (data && data.api_site && typeof data.api_site === 'object' && !Array.isArray(data.api_site)) {
+    const copy = JSON.parse(JSON.stringify(data))
+    for (const [key, val] of Object.entries(copy.api_site)) {
+      const k = String(key)
+      const name = val && val.name ? String(val.name) : ''
+      const api = val && val.api ? String(val.api) : ''
+      if (disabledSet.has(k) || disabledSet.has(name) || disabledSet.has(api)) {
+        delete copy.api_site[key]
+      }
+    }
+    return copy
+  }
+
+  // 针对数组格式
+  if (Array.isArray(data)) {
+    const res = data.filter(item => {
+      const k = String(item.key || item.name || item.api)
+      return !disabledSet.has(k) && !disabledSet.has(item.name) && !disabledSet.has(item.api)
+    })
+    return res.length > 0 ? res : data
+  }
+
+  return data
+}
+
+// 递归替换 API 代理前缀
 function addOrReplacePrefix(obj, newPrefix) {
   if (typeof obj !== 'object' || obj === null) return obj
   if (Array.isArray(obj)) return obj.map(item => addOrReplacePrefix(item, newPrefix))
@@ -79,16 +140,8 @@ function addOrReplacePrefix(obj, newPrefix) {
   for (const key of Object.keys(obj)) {
     if (key === 'api' && typeof obj[key] === 'string') {
       let apiUrl = obj[key]
-      
-      // 清除历史代理前缀
-      if (apiUrl.includes('?url=')) {
-        apiUrl = apiUrl.slice(apiUrl.indexOf('?url=') + 5)
-      }
-      
-      // 拼接当前中转前缀
-      if (!apiUrl.startsWith(newPrefix)) {
-        apiUrl = newPrefix + apiUrl
-      }
+      if (apiUrl.includes('?url=')) apiUrl = apiUrl.slice(apiUrl.indexOf('?url=') + 5)
+      if (!apiUrl.startsWith(newPrefix)) apiUrl = newPrefix + apiUrl
       newObj[key] = apiUrl
     } else {
       newObj[key] = addOrReplacePrefix(obj[key], newPrefix)
@@ -97,35 +150,43 @@ function addOrReplacePrefix(obj, newPrefix) {
   return newObj
 }
 
-// ================= 配置缓存读取 =================
-async function getCachedJSON(url, env) {
-  const cacheKey = 'CONFIG_CACHE_' + url
+// 拉取源配置
+async function fetchConfig(sourceKey, env, forceRefresh = false) {
+  const kv = getKV(env)
+  const cacheKey = 'CONFIG_CACHE_' + sourceKey
 
-  // 优先使用 KV（如果绑定了名为 KV 的命名空间）
-  if (env && env.KV && typeof env.KV.get === 'function') {
-    const cached = await env.KV.get(cacheKey)
-    if (cached) {
-      try {
-        return JSON.parse(cached)
-      } catch {
-        await env.KV.delete(cacheKey)
+  if (kv && !forceRefresh) {
+    try {
+      const cached = await kv.get(cacheKey)
+      if (cached) {
+        const parsed = JSON.parse(cached)
+        if (extractSourceList(parsed).length > 0) return parsed
       }
-    }
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`Fetch config failed: ${res.status}`)
-    const data = await res.json()
-    // 缓存 30 分钟 (1800 秒)
-    await env.KV.put(cacheKey, JSON.stringify(data), { expirationTtl: 1800 })
-    return data
+    } catch {}
   }
 
-  // 未绑定 KV 时直接拉取源站
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`Fetch config failed: ${res.status}`)
-  return await res.json()
+  const urls = JSON_SOURCES[sourceKey] || JSON_SOURCES['jingjian']
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'application/json, text/plain, */*'
+        }
+      })
+      if (res.ok) {
+        const data = await res.json()
+        if (data && extractSourceList(data).length > 0) {
+          if (kv) await kv.put(cacheKey, JSON.stringify(data), { expirationTtl: 3600 }).catch(() => {})
+          return data
+        }
+      }
+    } catch {}
+  }
+  throw new Error('无法连接配置源，请稍后重试')
 }
 
-// ================= 主路由分发 =================
+// ================= 主请求路由 =================
 async function handleRequest(request, env, ctx) {
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS })
@@ -135,17 +196,59 @@ async function handleRequest(request, env, ctx) {
   const currentOrigin = reqUrl.origin
   const defaultPrefix = `${currentOrigin}/?url=`
 
-  // 1. 健康检测
-  if (reqUrl.pathname === '/health') {
-    return new Response('OK', { status: 200, headers: CORS_HEADERS })
-  }
-
-  // 2. 通用 API 代理模式 (匹配 ?url=)
+  // 1. 通用 API 反代转发
   if (reqUrl.searchParams.has('url') || request.url.includes('?url=')) {
     return handleProxyRequest(request, currentOrigin)
   }
 
-  // 3. 订阅源生成模式 (匹配 ?format=)
+  // 2. 异步拉取源接口
+  if (reqUrl.pathname === '/api/manage/sources') {
+    const sourceKey = reqUrl.searchParams.get('source') || 'jingjian'
+    const force = reqUrl.searchParams.get('refresh') === '1'
+    try {
+      const rawData = await fetchConfig(sourceKey, env, force)
+      const list = extractSourceList(rawData)
+      const kv = getKV(env)
+      let disabledList = []
+      if (kv) {
+        const stored = await kv.get(`DISABLED_${sourceKey}`)
+        if (stored) {
+          try { disabledList = JSON.parse(stored) } catch {}
+        }
+      }
+      return jsonResponse({ list, disabled: disabledList })
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500)
+    }
+  }
+
+  // 3. 保存禁用源列表到 KV
+  if (reqUrl.pathname === '/api/manage/save-disabled' && request.method === 'POST') {
+    const kv = getKV(env)
+    if (!kv) return jsonResponse({ error: '未检测到绑定的 KV 空间，请检查设置并重新部署' }, 400)
+    try {
+      const body = await request.json()
+      const { source, disabled } = body
+      await kv.put(`DISABLED_${source || 'jingjian'}`, JSON.stringify(disabled || []))
+      return jsonResponse({ success: true })
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500)
+    }
+  }
+
+  // 4. 重置全部源（解除禁用）
+  if (reqUrl.pathname === '/api/manage/reset' && request.method === 'POST') {
+    const kv = getKV(env)
+    if (kv) {
+      const body = await request.json()
+      const source = body.source || 'jingjian'
+      await kv.delete(`DISABLED_${source}`)
+      await kv.delete('CONFIG_CACHE_' + source)
+    }
+    return jsonResponse({ success: true })
+  }
+
+  // 5. 播放器订阅拉取（自动剔除禁用源）
   if (reqUrl.searchParams.has('format')) {
     const formatParam = reqUrl.searchParams.get('format')
     const sourceParam = reqUrl.searchParams.get('source') || 'full'
@@ -153,23 +256,18 @@ async function handleRequest(request, env, ctx) {
     return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env)
   }
 
-  // 4. 默认主页文档
-  return handleHomePage(currentOrigin, defaultPrefix)
+  // 6. 首页展示（图 2 原版设计）
+  return handleHomePage(currentOrigin, env)
 }
 
-// ================= API 代理核心逻辑 =================
+// ================= API 反代核心 =================
 async function handleProxyRequest(request, currentOrigin) {
-  // 提取真实目标 URL（保留 url 后的全部后续查询参数）
   const marker = '?url='
   const markerIdx = request.url.indexOf(marker)
   let rawTarget = request.url.slice(markerIdx + marker.length).trim()
+  try { rawTarget = decodeURIComponent(rawTarget) } catch {}
 
-  try {
-    rawTarget = decodeURIComponent(rawTarget)
-  } catch {}
-
-  // 🛠️ 关键修复：修复播放器误用 & 拼接搜索词的问题
-  // 例如将 .../vod/&wd=test 转换为 .../vod/?wd=test
+  // 自动修复播放器参数拼接中缺失的 '?'
   const schemeIdx = rawTarget.indexOf('://')
   if (schemeIdx !== -1) {
     const pathAndQuery = rawTarget.slice(schemeIdx + 3)
@@ -179,51 +277,33 @@ async function handleProxyRequest(request, currentOrigin) {
     }
   }
 
-  // 安全检查
-  if (rawTarget.startsWith(currentOrigin)) {
-    return jsonResponse({ error: 'Loop detected: self-fetch blocked' }, 400)
-  }
-
   let targetURL
-  try {
-    targetURL = new URL(rawTarget)
-  } catch {
-    return jsonResponse({ error: 'Invalid URL', target: rawTarget }, 400)
+  try { targetURL = new URL(rawTarget) } catch {
+    return jsonResponse({ error: 'Invalid Target URL', target: rawTarget }, 400)
   }
 
   try {
-    // 构造请求头，去除防盗链与 Cloudflare 内部标记
     const forwardedHeaders = new Headers(request.headers)
     forwardedHeaders.delete('host')
     forwardedHeaders.delete('referer')
     forwardedHeaders.delete('origin')
     forwardedHeaders.delete('cf-connecting-ip')
     forwardedHeaders.delete('cf-ray')
-    forwardedHeaders.delete('cf-ipcountry')
-    forwardedHeaders.delete('cf-visitor')
-    forwardedHeaders.delete('x-real-ip')
-    forwardedHeaders.delete('x-forwarded-for')
-
-    // 伪装浏览器 User-Agent
-    forwardedHeaders.set('user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
+    forwardedHeaders.set('user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36')
     forwardedHeaders.set('accept', '*/*')
 
     const proxyRequest = new Request(targetURL.toString(), {
       method: request.method,
       headers: forwardedHeaders,
-      body: request.method !== 'GET' && request.method !== 'HEAD'
-        ? await request.arrayBuffer()
-        : undefined,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? await request.arrayBuffer() : undefined,
       redirect: 'follow'
     })
 
-    // 设置 12 秒超时保护
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 12000)
+    const timeoutId = setTimeout(() => controller.abort(), 10000)
     const response = await fetch(proxyRequest, { signal: controller.signal })
     clearTimeout(timeoutId)
 
-    // 构造透传响应头，合并 CORS 配置
     const responseHeaders = new Headers(CORS_HEADERS)
     for (const [key, value] of response.headers) {
       if (!EXCLUDE_RESPONSE_HEADERS.has(key.toLowerCase())) {
@@ -236,128 +316,4 @@ async function handleProxyRequest(request, currentOrigin) {
       statusText: response.statusText,
       headers: responseHeaders
     })
-  } catch (err) {
-    return jsonResponse({
-      error: 'Proxy Error',
-      message: err.message || '代理请求失败',
-      target: rawTarget
-    }, 502)
-  }
-}
-
-// ================= 订阅配置处理逻辑 =================
-async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env) {
-  try {
-    const config = FORMAT_CONFIG[formatParam]
-    if (!config) {
-      return jsonResponse({ error: 'Invalid format parameter', format: formatParam }, 400)
-    }
-
-    const selectedSource = JSON_SOURCES[sourceParam] || JSON_SOURCES['full']
-    const data = await getCachedJSON(selectedSource, env)
-
-    // 替换 API 前缀
-    const finalData = config.proxy
-      ? addOrReplacePrefix(data, prefixParam || defaultPrefix)
-      : data
-
-    // 输出 Base58 或 JSON
-    if (config.base58) {
-      const encoded = base58Encode(finalData)
-      return new Response(encoded, {
-        headers: { 'Content-Type': 'text/plain; charset=UTF-8', ...CORS_HEADERS },
-      })
-    } else {
-      return new Response(JSON.stringify(finalData), {
-        headers: { 'Content-Type': 'application/json; charset=UTF-8', ...CORS_HEADERS },
-      })
-    }
-  } catch (err) {
-    return jsonResponse({ error: 'Config Process Error', message: err.message }, 500)
-  }
-}
-
-// ================= 首页文档 UI =================
-async function handleHomePage(origin, defaultPrefix) {
-  const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CORSAPI - API 代理 & JSON 订阅器</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 820px; margin: 40px auto; padding: 20px; line-height: 1.6; color: #333; }
-    h1 { font-size: 24px; border-bottom: 2px solid #eee; padding-bottom: 10px; }
-    h2 { font-size: 18px; margin-top: 25px; }
-    code { background: #f4f4f5; padding: 3px 6px; border-radius: 4px; font-size: 13px; color: #d63384; }
-    pre { background: #272822; color: #f8f8f2; padding: 12px; border-radius: 6px; overflow-x: auto; }
-    .card { background: #fafafa; border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px; margin: 15px 0; }
-    .link-group { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; background: #fff; padding: 8px 12px; border-radius: 6px; border: 1px solid #ddd; }
-    .copy-btn { cursor: pointer; background: #0070f3; color: #fff; border: none; padding: 5px 12px; border-radius: 4px; font-size: 12px; }
-    .copy-btn:hover { background: #0051a8; }
-  </style>
-</head>
-<body>
-  <h1>⚡ CORSAPI（API 代理 & JSON 订阅器）</h1>
-  <p>基于 Cloudflare Workers 的中转代理，支持自动注入代理前缀并生成 Base58 格式订阅。</p>
-
-  <h2>1. 通用 API 中转代理</h2>
-  <pre>${defaultPrefix}https://ikunzyapi.com/api.php/provide/vod/</pre>
-
-  <h2>2. 订阅链接生成</h2>
-  <div class="card">
-    <strong>📦 精简版（31个精选资源）</strong>
-    <div class="link-group">
-      <span>中转 JSON：<code>${origin}/?format=1&source=jin18</code></span>
-      <button class="copy-btn" onclick="copyText('${origin}/?format=1&source=jin18')">复制</button>
-    </div>
-    <div class="link-group">
-      <span>中转 Base58：<code>${origin}/?format=3&source=jin18</code></span>
-      <button class="copy-btn" onclick="copyText('${origin}/?format=3&source=jin18')">复制</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <strong>📦 精简 + 成人版（61个资源，推荐）</strong>
-    <div class="link-group">
-      <span>中转 JSON：<code>${origin}/?format=1&source=jingjian</code></span>
-      <button class="copy-btn" onclick="copyText('${origin}/?format=1&source=jingjian')">复制</button>
-    </div>
-    <div class="link-group">
-      <span>中转 Base58：<code>${origin}/?format=3&source=jingjian</code></span>
-      <button class="copy-btn" onclick="copyText('${origin}/?format=3&source=jingjian')">复制</button>
-    </div>
-  </div>
-
-  <div class="card">
-    <strong>📦 完整版（88个资源，默认）</strong>
-    <div class="link-group">
-      <span>中转 JSON：<code>${origin}/?format=1&source=full</code></span>
-      <button class="copy-btn" onclick="copyText('${origin}/?format=1&source=full')">复制</button>
-    </div>
-    <div class="link-group">
-      <span>中转 Base58：<code>${origin}/?format=3&source=full</code></span>
-      <button class="copy-btn" onclick="copyText('${origin}/?format=3&source=full')">复制</button>
-    </div>
-  </div>
-
-  <script>
-    function copyText(text) {
-      navigator.clipboard.writeText(text).then(() => alert('已复制到剪贴板！'));
-    }
-  </script>
-</body>
-</html>`
-
-  return new Response(html, {
-    status: 200,
-    headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS }
-  })
-}
-
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS_HEADERS }
-  })
-}
+  } catch
