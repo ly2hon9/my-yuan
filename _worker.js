@@ -18,7 +18,6 @@ const EXCLUDE_RESPONSE_HEADERS = new Set([
   'connection', 'keep-alive', 'set-cookie', 'set-cookie2'
 ])
 
-// 容灾多线路源地址（GitHub + jsDelivr CDN）
 const JSON_SOURCES = {
   'jin18': [
     'https://raw.githubusercontent.com/hafrey1/LunaTV-config/refs/heads/main/jin18.json',
@@ -45,12 +44,17 @@ const FORMAT_CONFIG = {
   'proxy-base58': { proxy: true, base58: true }
 }
 
-// 获取绑定的 KV 实例（全面兼容 KV 与 LUNATV_KV）
+// 智能捕获 KV 绑定（自动适配 KV, LUNATV_KV 或任意绑定的命名空间）
 function getKV(env) {
   if (env) {
     if (env.KV && typeof env.KV.get === 'function') return env.KV
     if (env.LUNATV_KV && typeof env.LUNATV_KV.get === 'function') return env.LUNATV_KV
     if (env.CONFIG_KV && typeof env.CONFIG_KV.get === 'function') return env.CONFIG_KV
+    for (const k of Object.keys(env)) {
+      if (env[k] && typeof env[k].get === 'function' && typeof env[k].put === 'function') {
+        return env[k]
+      }
+    }
   }
   if (typeof globalThis.KV !== 'undefined' && globalThis.KV && typeof globalThis.KV.get === 'function') return globalThis.KV
   return null
@@ -86,85 +90,61 @@ function base58Encode(data) {
 // ================= 源列表智能解析 =================
 function extractSourceList(data) {
   if (!data) return []
-  // 1. 适配 api_site 字典对象
+  // 1. 深度适配 LunaTV 标准的 api_site 字典
   if (data.api_site && typeof data.api_site === 'object' && !Array.isArray(data.api_site)) {
     return Object.entries(data.api_site).map(([key, val]) => ({
       key: key,
-      name: (val && val.name) ? val.name : key,
-      api: (val && val.api) ? val.api : '',
+      name: (val && val.name) ? String(val.name).trim() : key,
+      api: (val && val.api) ? String(val.api).trim() : '',
       ...val
     }))
   }
-  // 2. 适配 sites/video/sources/list 数组
+  // 2. 兼容数组结构
   for (const k of ['sites', 'video', 'sources', 'list']) {
     if (Array.isArray(data[k])) return data[k]
   }
-  // 3. 适配直接数组
   if (Array.isArray(data)) return data
-  // 4. 适配直接以资源名为 key 的顶层字典
-  if (typeof data === 'object') {
-    const list = []
-    for (const [k, v] of Object.entries(data)) {
-      if (v && typeof v === 'object' && (v.api || v.name)) {
-        list.push({ key: k, name: v.name || k, api: v.api || '', ...v })
-      }
-    }
-    if (list.length > 0) return list
-  }
   return []
 }
 
-// ================= 彻底修复：全方位递归剔除已禁用源 =================
-function filterDisabled(data, disabledKeys = []) {
-  if (!disabledKeys || disabledKeys.length === 0) return data
-  const disabledSet = new Set(disabledKeys.map(k => String(k).trim().toLowerCase()))
+// ================= 核心修复：多维特征精准剔除禁用源 =================
+function filterDisabled(data, disabledList = []) {
+  if (!disabledList || disabledList.length === 0) return data
+  const disabledSet = new Set(disabledList.map(s => String(s).trim().toLowerCase()))
 
-  const isMatch = (item, objKey = '') => {
-    if (!item && !objKey) return false
-    const candidates = []
-    if (objKey) candidates.push(String(objKey).trim().toLowerCase())
-    if (typeof item === 'object' && item !== null) {
-      if (item.key) candidates.push(String(item.key).trim().toLowerCase())
-      if (item.name) candidates.push(String(item.name).trim().toLowerCase())
-      if (item.api) candidates.push(String(item.api).trim().toLowerCase())
-    } else if (typeof item === 'string') {
-      candidates.push(String(item).trim().toLowerCase())
+  // 判断当前源是否在禁用黑名单中（按 key、名称、或 api 精准识别）
+  const shouldRemove = (val, dictKey = '') => {
+    if (dictKey && disabledSet.has(String(dictKey).trim().toLowerCase())) return true
+    if (val && typeof val === 'object') {
+      if (val.key && disabledSet.has(String(val.key).trim().toLowerCase())) return true
+      if (val.name && disabledSet.has(String(val.name).trim().toLowerCase())) return true
+      if (val.api && disabledSet.has(String(val.api).trim().toLowerCase())) return true
+    } else if (typeof val === 'string') {
+      if (disabledSet.has(val.trim().toLowerCase())) return true
     }
-    return candidates.some(c => disabledSet.has(c))
+    return false
   }
 
   const copy = JSON.parse(JSON.stringify(data))
 
-  // 1. 数组结构
-  if (Array.isArray(copy)) {
-    const filtered = copy.filter(item => !isMatch(item))
-    return filtered.length > 0 ? filtered : copy
-  }
-
-  // 2. 对象结构
-  if (typeof copy === 'object' && copy !== null) {
-    // 2.1 过滤 api_site 字典
-    if (copy.api_site && typeof copy.api_site === 'object' && !Array.isArray(copy.api_site)) {
-      for (const [k, v] of Object.entries(copy.api_site)) {
-        if (isMatch(v, k)) delete copy.api_site[k]
-      }
-    }
-
-    // 2.2 过滤 sites, video, list 等子数组
-    for (const listKey of ['sites', 'video', 'sources', 'source', 'list', 'data']) {
-      if (Array.isArray(copy[listKey])) {
-        copy[listKey] = copy[listKey].filter(item => !isMatch(item))
-      }
-    }
-
-    // 2.3 过滤顶层直接字典
-    for (const [k, v] of Object.entries(copy)) {
-      if (k === 'api_site' || Array.isArray(v)) continue
-      if (v && typeof v === 'object' && (v.api || v.name)) {
-        if (isMatch(v, k)) delete copy[k]
+  // 1. 针对 api_site 字典进行清理
+  if (copy.api_site && typeof copy.api_site === 'object' && !Array.isArray(copy.api_site)) {
+    for (const [k, v] of Object.entries(copy.api_site)) {
+      if (shouldRemove(v, k)) {
+        delete copy.api_site[k]
       }
     }
     return copy
+  }
+
+  // 2. 针对数组进行清理
+  if (Array.isArray(copy)) {
+    return copy.filter(item => !shouldRemove(item))
+  }
+  for (const listKey of ['sites', 'video', 'sources', 'list']) {
+    if (Array.isArray(copy[listKey])) {
+      copy[listKey] = copy[listKey].filter(item => !shouldRemove(item))
+    }
   }
 
   return copy
@@ -240,7 +220,7 @@ async function handleRequest(request, env, ctx) {
     return handleProxyRequest(request, currentOrigin)
   }
 
-  // 2. 异步拉取源接口
+  // 2. 异步接口：获取源列表与禁用状态
   if (reqUrl.pathname === '/api/manage/sources') {
     const sourceKey = reqUrl.searchParams.get('source') || 'jingjian'
     const force = reqUrl.searchParams.get('refresh') === '1'
@@ -250,10 +230,12 @@ async function handleRequest(request, env, ctx) {
       const kv = getKV(env)
       let disabledList = []
       if (kv) {
+        // 读取专属配置与全局库
         const stored = await kv.get(`DISABLED_${sourceKey}`)
-        if (stored) {
-          try { disabledList = JSON.parse(stored) } catch {}
-        }
+        const globalStored = await kv.get('DISABLED_GLOBAL')
+        const s1 = stored ? JSON.parse(stored) : []
+        const s2 = globalStored ? JSON.parse(globalStored) : []
+        disabledList = Array.from(new Set([...s1, ...s2]))
       }
       return jsonResponse({ list, disabled: disabledList })
     } catch (e) {
@@ -261,7 +243,7 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // 3. 保存禁用源列表到 KV（修复同步生效）
+  // 3. 保存禁用列表到 KV（实现跨配置全局互通）
   if (reqUrl.pathname === '/api/manage/save-disabled' && request.method === 'POST') {
     const kv = getKV(env)
     if (!kv) return jsonResponse({ error: '未检测到绑定的 KV 空间' }, 400)
@@ -269,10 +251,26 @@ async function handleRequest(request, env, ctx) {
       const body = await request.json()
       const { source, disabled } = body
       const sourceKey = source || 'jingjian'
-      await kv.put(`DISABLED_${sourceKey}`, JSON.stringify(disabled || []))
-      // 同时清空旧缓存，保证订阅拉取时立即生效
+      const disabledArray = Array.isArray(disabled) ? disabled : []
+
+      // 保存当前版本并合并到全局库
+      await kv.put(`DISABLED_${sourceKey}`, JSON.stringify(disabledArray))
+      
+      let globalList = []
+      try {
+        const g = await kv.get('DISABLED_GLOBAL')
+        if (g) globalList = JSON.parse(g)
+      } catch {}
+      const mergedGlobal = Array.from(new Set([...globalList, ...disabledArray]))
+      await kv.put('DISABLED_GLOBAL', JSON.stringify(mergedGlobal))
+
+      // 清理缓存，确保拉取立即生效
       await kv.delete(`CONFIG_CACHE_${sourceKey}`).catch(() => {})
-      return jsonResponse({ success: true, count: (disabled || []).length })
+      await kv.delete('CONFIG_CACHE_jingjian').catch(() => {})
+      await kv.delete('CONFIG_CACHE_full').catch(() => {})
+      await kv.delete('CONFIG_CACHE_jin18').catch(() => {})
+
+      return jsonResponse({ success: true, count: disabledArray.length })
     } catch (e) {
       return jsonResponse({ error: e.message }, 500)
     }
@@ -285,12 +283,13 @@ async function handleRequest(request, env, ctx) {
       const body = await request.json()
       const source = body.source || 'jingjian'
       await kv.delete(`DISABLED_${source}`)
+      await kv.delete('DISABLED_GLOBAL')
       await kv.delete('CONFIG_CACHE_' + source)
     }
     return jsonResponse({ success: true })
   }
 
-  // 5. 播放器订阅拉取（自动剔除禁用源 + 强制禁用 CDN 缓存）
+  // 5. 播放器订阅拉取（强制无缓存头）
   if (reqUrl.searchParams.has('format')) {
     const formatParam = reqUrl.searchParams.get('format')
     const sourceParam = reqUrl.searchParams.get('source') || 'full'
@@ -298,7 +297,7 @@ async function handleRequest(request, env, ctx) {
     return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env)
   }
 
-  // 6. 首页展示：保留图 6 经典功能 + 图 5 测速面板（平铺 3 个配置按钮）
+  // 6. 首页展示：保留经典功能 + 去除标题括号与资源数
   return handleHomePage(currentOrigin, defaultPrefix, env)
 }
 
@@ -309,7 +308,6 @@ async function handleProxyRequest(request, currentOrigin) {
   let rawTarget = request.url.slice(markerIdx + marker.length).trim()
   try { rawTarget = decodeURIComponent(rawTarget) } catch {}
 
-  // 自动修复播放器参数拼接缺失的 '?'
   const schemeIdx = rawTarget.indexOf('://')
   if (schemeIdx !== -1) {
     const pathAndQuery = rawTarget.slice(schemeIdx + 3)
@@ -363,7 +361,7 @@ async function handleProxyRequest(request, currentOrigin) {
   }
 }
 
-// ================= 生成订阅处理（带无缓存头，杜绝旧缓存） =================
+// ================= 生成订阅处理（带强制防缓存） =================
 async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env) {
   try {
     const config = FORMAT_CONFIG[formatParam]
@@ -376,22 +374,27 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
     if (kv) {
       try {
         const stored = await kv.get(`DISABLED_${sourceParam}`)
-        if (stored) disabledKeys = JSON.parse(stored)
+        const globalStored = await kv.get('DISABLED_GLOBAL')
+        const s1 = stored ? JSON.parse(stored) : []
+        const s2 = globalStored ? JSON.parse(globalStored) : []
+        disabledKeys = Array.from(new Set([...s1, ...s2]))
       } catch {}
     }
 
-    // 剔除禁用的源
+    // 执行强力过滤
     data = filterDisabled(data, disabledKeys)
 
     // 添加代理前缀
     const finalData = config.proxy ? addOrReplacePrefix(data, prefixParam || defaultPrefix) : data
 
-    // 关键：强制禁用浏览器和 CDN 缓存，保证播放器拉取时实时同步！
+    // 强行阻断所有 CDN 与本地缓存
     const noCacheHeaders = {
       ...CORS_HEADERS,
-      'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
       'Pragma': 'no-cache',
-      'Expires': '0'
+      'Expires': '0',
+      'CDN-Cache-Control': 'no-store',
+      'Cloudflare-CDN-Cache-Control': 'no-store'
     }
 
     if (config.base58) {
@@ -408,7 +411,7 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
   }
 }
 
-// ================= 完整前端页面 UI =================
+// ================= 前端页面 UI =================
 async function handleHomePage(origin, defaultPrefix, env) {
   let initialList = []
   let initialDisabled = []
@@ -418,7 +421,10 @@ async function handleHomePage(origin, defaultPrefix, env) {
     const kv = getKV(env)
     if (kv) {
       const stored = await kv.get('DISABLED_jingjian')
-      if (stored) initialDisabled = JSON.parse(stored)
+      const gStored = await kv.get('DISABLED_GLOBAL')
+      const s1 = stored ? JSON.parse(stored) : []
+      const s2 = gStored ? JSON.parse(gStored) : []
+      initialDisabled = Array.from(new Set([...s1, ...s2]))
     }
   } catch {}
 
@@ -454,7 +460,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
     .btn-copy { background: #0070f3; color: #fff; border: none; padding: 5px 12px; border-radius: 5px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
     .btn-copy:hover { opacity: 0.88; }
 
-    /* 3个配置直接平铺排列，不折叠 */
+    /* 3 个配置平铺排列 */
     .config-tabs-container { margin-bottom: 14px; }
     .config-tabs-label { font-size: 13px; color: var(--text-muted); margin-bottom: 6px; display: block; }
     .config-tabs-row { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -476,7 +482,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       font-weight: 500;
     }
 
-    /* 操作按钮 */
     .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
     .btn-action { border: none; padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; color: #fff; }
     .btn-blue { background: #0070f3; }
@@ -509,15 +514,17 @@ async function handleHomePage(origin, defaultPrefix, env) {
   <h1>⚡ CORSAPI（API 代理 & JSON 订阅器）</h1>
   <div class="subtitle">基于 Cloudflare Workers 的中转代理，支持自动注入代理前缀并生成 Base58 格式订阅。</div>
 
+  <!-- 1. 通用 API 中转代理 -->
   <h2>1. 通用 API 中转代理</h2>
   <div style="position: relative;">
     <pre id="generalProxy">${defaultPrefix}https://ikunzyapi.com/api.php/provide/vod/</pre>
   </div>
 
+  <!-- 2. 订阅链接生成（括号及资源描述已全部去除） -->
   <h2>2. 订阅链接生成</h2>
 
   <div class="card">
-    <div class="card-title">📦 精简版（31个精选资源）</div>
+    <div class="card-title">📦 精简版</div>
     <div class="link-row">
       <div class="link-content">中转 JSON：<code>${origin}/?format=1&source=jin18</code></div>
       <button class="btn-copy" onclick="copyText('${origin}/?format=1&source=jin18')">复制</button>
@@ -529,7 +536,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
   </div>
 
   <div class="card">
-    <div class="card-title">📦 精简 + 成人版（61个资源，推荐）</div>
+    <div class="card-title">📦 精简 + 成人版</div>
     <div class="link-row">
       <div class="link-content">中转 JSON：<code>${origin}/?format=1&source=jingjian</code></div>
       <button class="btn-copy" onclick="copyText('${origin}/?format=1&source=jingjian')">复制</button>
@@ -541,7 +548,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
   </div>
 
   <div class="card">
-    <div class="card-title">📦 完整版（88个资源，默认）</div>
+    <div class="card-title">📦 完整版</div>
     <div class="link-row">
       <div class="link-content">中转 JSON：<code>${origin}/?format=1&source=full</code></div>
       <button class="btn-copy" onclick="copyText('${origin}/?format=1&source=full')">复制</button>
@@ -552,13 +559,13 @@ async function handleHomePage(origin, defaultPrefix, env) {
     </div>
   </div>
 
+  <!-- 3. 资源源测速与可用性管理 -->
   <h2>📊 资源源测速与可用性管理</h2>
   <div class="card">
-    <!-- 3个直接平铺排列，不折叠 -->
     <div class="config-tabs-container">
       <span class="config-tabs-label">选择配置：</span>
       <div class="config-tabs-row">
-        <button type="button" class="config-tab-btn active" id="tab-jingjian" onclick="switchSource('jingjian')">精简+成人版 (推荐)</button>
+        <button type="button" class="config-tab-btn active" id="tab-jingjian" onclick="switchSource('jingjian')">精简+成人版</button>
         <button type="button" class="config-tab-btn" id="tab-jin18" onclick="switchSource('jin18')">精简版</button>
         <button type="button" class="config-tab-btn" id="tab-full" onclick="switchSource('full')">完整版</button>
       </div>
@@ -602,7 +609,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
     let disabledSet = new Set(${JSON.stringify(initialDisabled)});
     let isTesting = false;
 
-    // 渲染表格
     function renderTable() {
       const tbody = document.getElementById('tableBody');
       tbody.innerHTML = '';
@@ -623,7 +629,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
           <td style="text-align: center; color:var(--text-muted);" id="speed-\${index}">-</td>
           <td style="text-align: center;">
             <label class="switch">
-              <input type="checkbox" \${isEnabled ? 'checked' : ''} data-key="\${escapeHtml(key)}" onchange="toggleEnable(this)">
+              <input type="checkbox" \${isEnabled ? 'checked' : ''} data-index="\${index}" onchange="toggleEnable(\${index}, this.checked)">
               <span class="slider"></span>
             </label>
           </td>
@@ -635,12 +641,10 @@ async function handleHomePage(origin, defaultPrefix, env) {
       document.getElementById('disabledCount').innerText = disabledNum;
     }
 
-    // 平铺选项直接切换
     async function switchSource(sourceKey) {
       if (currentSource === sourceKey && sourcesList.length > 0) return;
       currentSource = sourceKey;
 
-      // 更新按钮高亮
       document.querySelectorAll('.config-tab-btn').forEach(btn => btn.classList.remove('active'));
       const activeBtn = document.getElementById('tab-' + sourceKey);
       if (activeBtn) activeBtn.classList.add('active');
@@ -661,17 +665,28 @@ async function handleHomePage(origin, defaultPrefix, env) {
       }
     }
 
-    function toggleEnable(el) {
-      const key = el.getAttribute('data-key');
-      if (el.checked) {
-        disabledSet.delete(key);
+    function toggleEnable(index, isChecked) {
+      const item = sourcesList[index];
+      if (!item) return;
+      const k = String(item.key || item.name || item.api);
+      if (isChecked) {
+        disabledSet.delete(k);
+        if (item.name) disabledSet.delete(item.name);
+        if (item.api) disabledSet.delete(item.api);
       } else {
-        disabledSet.add(key);
+        disabledSet.add(k);
+        if (item.name) disabledSet.add(item.name);
+        if (item.api) disabledSet.add(item.api);
       }
-      document.getElementById('disabledCount').innerText = disabledSet.size;
+      // 重新统计禁用个数
+      let num = 0;
+      sourcesList.forEach(it => {
+        const ik = String(it.key || it.name || it.api);
+        if (disabledSet.has(ik) || disabledSet.has(it.name) || disabledSet.has(it.api)) num++;
+      });
+      document.getElementById('disabledCount').innerText = num;
     }
 
-    // 单个测速与搜索检测
     async function testSingle(item, index) {
       const statusEl = document.getElementById('status-' + index);
       const searchEl = document.getElementById('search-' + index);
@@ -714,7 +729,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       }
     }
 
-    // 并发测速
     async function runSpeedTest() {
       if (isTesting) return;
       isTesting = true;
@@ -737,21 +751,21 @@ async function handleHomePage(origin, defaultPrefix, env) {
       document.getElementById('startBtn').disabled = false;
     }
 
-    // 禁用失效源
     function disableFailedSources() {
       sourcesList.forEach((item, index) => {
         const searchEl = document.getElementById('search-' + index);
         if (searchEl && searchEl.innerText.includes('❌')) {
-          const key = String(item.key || item.name || item.api);
-          disabledSet.add(key);
+          const k = String(item.key || item.name || item.api);
+          disabledSet.add(k);
+          if (item.name) disabledSet.add(item.name);
+          if (item.api) disabledSet.add(item.api);
         }
       });
       renderTable();
     }
 
-    // 重置恢复全部
     async function resetSources() {
-      if (!confirm('确定要清空当前所有禁用状态，恢复所有源吗？')) return;
+      if (!confirm('确定要清空所有禁用状态，恢复所有源吗？')) return;
       try {
         await fetch('/api/manage/reset', {
           method: 'POST',
@@ -766,11 +780,21 @@ async function handleHomePage(origin, defaultPrefix, env) {
       }
     }
 
-    // 保存状态到 KV
     async function saveState() {
       const btn = document.getElementById('saveBtn');
       btn.innerText = '保存中...';
       btn.disabled = true;
+
+      // 提取完整的禁用集合（包含 key、name 与 api）
+      const disabledPayload = [];
+      sourcesList.forEach(item => {
+        const k = String(item.key || item.name || item.api);
+        if (disabledSet.has(k) || (item.name && disabledSet.has(item.name)) || (item.api && disabledSet.has(item.api))) {
+          if (item.key) disabledPayload.push(item.key);
+          if (item.name) disabledPayload.push(item.name);
+          if (item.api) disabledPayload.push(item.api);
+        }
+      });
 
       try {
         const res = await fetch('/api/manage/save-disabled', {
@@ -778,12 +802,15 @@ async function handleHomePage(origin, defaultPrefix, env) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             source: currentSource,
-            disabled: Array.from(disabledSet)
+            disabled: Array.from(new Set(disabledPayload))
           })
         });
         const ret = await res.json();
         if (ret.success) {
-          alert('✅ 配置已保存成功！已持久化并过滤 ' + ret.count + ' 个禁用源，播放器拉取时已自动剔除不同步。');
+          const disabledCount = parseInt(document.getElementById('disabledCount').innerText) || 0;
+          const totalCount = sourcesList.length;
+          const activeCount = totalCount - disabledCount;
+          alert(\`✅ 配置已成功保存并同步！\\n已剔除 \${disabledCount} 个禁用源，播放器拉取时仅返回剩余 \${activeCount} 个正常源。\\n\\n💡 提示：若播放器仍显示旧源，请在播放器内点击【刷新/重新载入配置】以清除本地缓存。\`);
         } else {
           alert('保存失败: ' + (ret.error || 'KV 存储未配置'));
         }
