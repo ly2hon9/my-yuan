@@ -44,7 +44,7 @@ const FORMAT_CONFIG = {
   'proxy-base58': { proxy: true, base58: true }
 }
 
-// 智能捕获 KV 绑定（自动适配 KV, LUNATV_KV 或任意绑定的命名空间）
+// 智能捕获 KV 绑定
 function getKV(env) {
   if (env) {
     if (env.KV && typeof env.KV.get === 'function') return env.KV
@@ -90,7 +90,6 @@ function base58Encode(data) {
 // ================= 源列表智能解析 =================
 function extractSourceList(data) {
   if (!data) return []
-  // 1. 深度适配 LunaTV 标准的 api_site 字典
   if (data.api_site && typeof data.api_site === 'object' && !Array.isArray(data.api_site)) {
     return Object.entries(data.api_site).map(([key, val]) => ({
       key: key,
@@ -99,7 +98,6 @@ function extractSourceList(data) {
       ...val
     }))
   }
-  // 2. 兼容数组结构
   for (const k of ['sites', 'video', 'sources', 'list']) {
     if (Array.isArray(data[k])) return data[k]
   }
@@ -107,12 +105,11 @@ function extractSourceList(data) {
   return []
 }
 
-// ================= 核心修复：多维特征精准剔除禁用源 =================
+// ================= 严格过滤已禁用源 =================
 function filterDisabled(data, disabledList = []) {
   if (!disabledList || disabledList.length === 0) return data
   const disabledSet = new Set(disabledList.map(s => String(s).trim().toLowerCase()))
 
-  // 判断当前源是否在禁用黑名单中（按 key、名称、或 api 精准识别）
   const shouldRemove = (val, dictKey = '') => {
     if (dictKey && disabledSet.has(String(dictKey).trim().toLowerCase())) return true
     if (val && typeof val === 'object') {
@@ -126,18 +123,12 @@ function filterDisabled(data, disabledList = []) {
   }
 
   const copy = JSON.parse(JSON.stringify(data))
-
-  // 1. 针对 api_site 字典进行清理
   if (copy.api_site && typeof copy.api_site === 'object' && !Array.isArray(copy.api_site)) {
     for (const [k, v] of Object.entries(copy.api_site)) {
-      if (shouldRemove(v, k)) {
-        delete copy.api_site[k]
-      }
+      if (shouldRemove(v, k)) delete copy.api_site[k]
     }
     return copy
   }
-
-  // 2. 针对数组进行清理
   if (Array.isArray(copy)) {
     return copy.filter(item => !shouldRemove(item))
   }
@@ -146,7 +137,6 @@ function filterDisabled(data, disabledList = []) {
       copy[listKey] = copy[listKey].filter(item => !shouldRemove(item))
     }
   }
-
   return copy
 }
 
@@ -220,7 +210,7 @@ async function handleRequest(request, env, ctx) {
     return handleProxyRequest(request, currentOrigin)
   }
 
-  // 2. 异步接口：获取源列表与禁用状态
+  // 2. 异步接口：获取源列表、禁用状态及历史测速缓存
   if (reqUrl.pathname === '/api/manage/sources') {
     const sourceKey = reqUrl.searchParams.get('source') || 'jingjian'
     const force = reqUrl.searchParams.get('refresh') === '1'
@@ -229,33 +219,38 @@ async function handleRequest(request, env, ctx) {
       const list = extractSourceList(rawData)
       const kv = getKV(env)
       let disabledList = []
+      let testResults = {}
       if (kv) {
-        // 读取专属配置与全局库
         const stored = await kv.get(`DISABLED_${sourceKey}`)
         const globalStored = await kv.get('DISABLED_GLOBAL')
         const s1 = stored ? JSON.parse(stored) : []
         const s2 = globalStored ? JSON.parse(globalStored) : []
         disabledList = Array.from(new Set([...s1, ...s2]))
+
+        const tStored = await kv.get(`TEST_RESULTS_${sourceKey}`)
+        if (tStored) testResults = JSON.parse(tStored)
       }
-      return jsonResponse({ list, disabled: disabledList })
+      return jsonResponse({ list, disabled: disabledList, testResults })
     } catch (e) {
       return jsonResponse({ error: e.message }, 500)
     }
   }
 
-  // 3. 保存禁用列表到 KV（实现跨配置全局互通）
+  // 3. 保存禁用列表和测速状态到 KV
   if (reqUrl.pathname === '/api/manage/save-disabled' && request.method === 'POST') {
     const kv = getKV(env)
     if (!kv) return jsonResponse({ error: '未检测到绑定的 KV 空间' }, 400)
     try {
       const body = await request.json()
-      const { source, disabled } = body
+      const { source, disabled, testResults } = body
       const sourceKey = source || 'jingjian'
       const disabledArray = Array.isArray(disabled) ? disabled : []
 
-      // 保存当前版本并合并到全局库
       await kv.put(`DISABLED_${sourceKey}`, JSON.stringify(disabledArray))
-      
+      if (testResults && typeof testResults === 'object') {
+        await kv.put(`TEST_RESULTS_${sourceKey}`, JSON.stringify(testResults))
+      }
+
       let globalList = []
       try {
         const g = await kv.get('DISABLED_GLOBAL')
@@ -264,32 +259,29 @@ async function handleRequest(request, env, ctx) {
       const mergedGlobal = Array.from(new Set([...globalList, ...disabledArray]))
       await kv.put('DISABLED_GLOBAL', JSON.stringify(mergedGlobal))
 
-      // 清理缓存，确保拉取立即生效
+      // 清理缓存使订阅实时生效
       await kv.delete(`CONFIG_CACHE_${sourceKey}`).catch(() => {})
-      await kv.delete('CONFIG_CACHE_jingjian').catch(() => {})
-      await kv.delete('CONFIG_CACHE_full').catch(() => {})
-      await kv.delete('CONFIG_CACHE_jin18').catch(() => {})
-
       return jsonResponse({ success: true, count: disabledArray.length })
     } catch (e) {
       return jsonResponse({ error: e.message }, 500)
     }
   }
 
-  // 4. 重置全部源（解除禁用）
+  // 4. 重置恢复全部源
   if (reqUrl.pathname === '/api/manage/reset' && request.method === 'POST') {
     const kv = getKV(env)
     if (kv) {
       const body = await request.json()
       const source = body.source || 'jingjian'
       await kv.delete(`DISABLED_${source}`)
+      await kv.delete(`TEST_RESULTS_${source}`)
       await kv.delete('DISABLED_GLOBAL')
       await kv.delete('CONFIG_CACHE_' + source)
     }
     return jsonResponse({ success: true })
   }
 
-  // 5. 播放器订阅拉取（强制无缓存头）
+  // 5. 播放器订阅拉取（强制禁用 CDN 与浏览器缓存）
   if (reqUrl.searchParams.has('format')) {
     const formatParam = reqUrl.searchParams.get('format')
     const sourceParam = reqUrl.searchParams.get('source') || 'full'
@@ -297,7 +289,7 @@ async function handleRequest(request, env, ctx) {
     return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env)
   }
 
-  // 6. 首页展示：保留经典功能 + 去除标题括号与资源数
+  // 6. 首页展示
   return handleHomePage(currentOrigin, defaultPrefix, env)
 }
 
@@ -361,7 +353,7 @@ async function handleProxyRequest(request, currentOrigin) {
   }
 }
 
-// ================= 生成订阅处理（带强制防缓存） =================
+// ================= 生成订阅处理 =================
 async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env) {
   try {
     const config = FORMAT_CONFIG[formatParam]
@@ -381,13 +373,9 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
       } catch {}
     }
 
-    // 执行强力过滤
     data = filterDisabled(data, disabledKeys)
-
-    // 添加代理前缀
     const finalData = config.proxy ? addOrReplacePrefix(data, prefixParam || defaultPrefix) : data
 
-    // 强行阻断所有 CDN 与本地缓存
     const noCacheHeaders = {
       ...CORS_HEADERS,
       'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
@@ -415,6 +403,7 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
 async function handleHomePage(origin, defaultPrefix, env) {
   let initialList = []
   let initialDisabled = []
+  let initialTestResults = {}
   try {
     const raw = await fetchConfig('jingjian', env)
     initialList = extractSourceList(raw)
@@ -425,6 +414,9 @@ async function handleHomePage(origin, defaultPrefix, env) {
       const s1 = stored ? JSON.parse(stored) : []
       const s2 = gStored ? JSON.parse(gStored) : []
       initialDisabled = Array.from(new Set([...s1, ...s2]))
+
+      const tStored = await kv.get('TEST_RESULTS_jingjian')
+      if (tStored) initialTestResults = JSON.parse(tStored)
     }
   } catch {}
 
@@ -460,7 +452,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
     .btn-copy { background: #0070f3; color: #fff; border: none; padding: 5px 12px; border-radius: 5px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
     .btn-copy:hover { opacity: 0.88; }
 
-    /* 3 个配置平铺排列 */
+    /* 平铺配置切换 */
     .config-tabs-container { margin-bottom: 14px; }
     .config-tabs-label { font-size: 13px; color: var(--text-muted); margin-bottom: 6px; display: block; }
     .config-tabs-row { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -485,7 +477,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
     .btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
     .btn-action { border: none; padding: 8px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; color: #fff; }
     .btn-blue { background: #0070f3; }
-    .btn-red { background: var(--danger); }
     .btn-orange { background: var(--warning); color: #000; font-weight: bold; }
     .btn-green { background: var(--success); }
     .btn-action:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -497,6 +488,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
     th, td { border: 1px solid var(--border); padding: 10px 8px; text-align: left; }
     th { background: #161a20; color: #94a3b8; font-weight: 500; }
     tr:nth-child(even) { background: #16191f; }
+    tr.is-disabled { opacity: 0.55; background: rgba(0, 0, 0, 0.2); }
     .badge { display: inline-flex; align-items: center; justify-content: center; font-size: 14px; }
     a.link-btn { color: var(--primary); text-decoration: none; }
     a.link-btn:hover { text-decoration: underline; }
@@ -520,7 +512,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
     <pre id="generalProxy">${defaultPrefix}https://ikunzyapi.com/api.php/provide/vod/</pre>
   </div>
 
-  <!-- 2. 订阅链接生成（括号及资源描述已全部去除） -->
+  <!-- 2. 订阅链接生成 -->
   <h2>2. 订阅链接生成</h2>
 
   <div class="card">
@@ -572,10 +564,9 @@ async function handleHomePage(origin, defaultPrefix, env) {
     </div>
 
     <div class="btn-group">
-      <button class="btn-action btn-blue" id="startBtn" onclick="runSpeedTest()">🚀 开始测速检测</button>
-      <button class="btn-action btn-red" onclick="disableFailedSources()">⛔ 禁用失效源</button>
+      <button class="btn-action btn-blue" id="startBtn" onclick="runSpeedTest()">🚀 开始测速检测 (自动禁用失效源并沉底)</button>
       <button class="btn-action btn-orange" onclick="resetSources()">🔄 重置全部源 (解除禁用)</button>
-      <button class="btn-action btn-green" id="saveBtn" onclick="saveState()">💾 保存同步</button>
+      <button class="btn-action btn-green" id="saveBtn" onclick="saveState(false)">💾 保存同步</button>
     </div>
 
     <div class="stats-bar">
@@ -607,29 +598,113 @@ async function handleHomePage(origin, defaultPrefix, env) {
     let currentSource = 'jingjian';
     let sourcesList = ${JSON.stringify(initialList)};
     let disabledSet = new Set(${JSON.stringify(initialDisabled)});
+    let testResultsMap = ${JSON.stringify(initialTestResults)};
     let isTesting = false;
 
+    // 获取源的通用 key
+    function getItemKey(item) {
+      return String(item.key || item.name || item.api);
+    }
+
+    // 检查源是否被禁用
+    function isItemDisabled(item) {
+      const k = getItemKey(item);
+      return disabledSet.has(k) || (item.name && disabledSet.has(item.name)) || (item.api && disabledSet.has(item.api));
+    }
+
+    // 沉底排序：正常可用源置顶在前，失效和禁用的源沉底在后
+    function sortSources() {
+      sourcesList.sort((a, b) => {
+        const disA = isItemDisabled(a);
+        const disB = isItemDisabled(b);
+        if (disA !== disB) return disA ? 1 : -1;
+
+        const resA = testResultsMap[getItemKey(a)];
+        const resB = testResultsMap[getItemKey(b)];
+        const failA = resA ? (!resA.ok || !resA.searchOk) : false;
+        const failB = resB ? (!resB.ok || !resB.searchOk) : false;
+        if (failA !== failB) return failA ? 1 : -1;
+
+        const latA = (resA && resA.latency) ? resA.latency : 99999;
+        const latB = (resB && resB.latency) ? resB.latency : 99999;
+        return latA - latB;
+      });
+    }
+
+    // 计算统计数据（避免显示为0）
+    function updateStats() {
+      const total = sourcesList.length;
+      let disabledNum = 0;
+      let okNum = 0;
+      let failNum = 0;
+
+      const hasHistory = Object.keys(testResultsMap).length > 0;
+
+      sourcesList.forEach(item => {
+        const k = getItemKey(item);
+        const dis = isItemDisabled(item);
+        if (dis) disabledNum++;
+
+        const res = testResultsMap[k];
+        if (res) {
+          if (res.ok && res.searchOk && !dis) okNum++;
+          else failNum++;
+        }
+      });
+
+      // 若尚未进行过任何测速，将启用的源计入可用，失效数显示为 0
+      if (!hasHistory) {
+        okNum = total - disabledNum;
+        failNum = 0;
+      }
+
+      document.getElementById('totalCount').innerText = total;
+      document.getElementById('okCount').innerText = okNum;
+      document.getElementById('failCount').innerText = failNum;
+      document.getElementById('disabledCount').innerText = disabledNum;
+    }
+
+    // 渲染表格
     function renderTable() {
+      sortSources();
       const tbody = document.getElementById('tableBody');
       tbody.innerHTML = '';
-      
-      let disabledNum = 0;
+
       sourcesList.forEach((item, index) => {
-        const key = String(item.key || item.name || item.api);
-        const isEnabled = !disabledSet.has(key) && !disabledSet.has(item.name) && !disabledSet.has(item.api);
-        if (!isEnabled) disabledNum++;
+        const k = getItemKey(item);
+        const isDis = isItemDisabled(item);
+        const res = testResultsMap[k];
+
+        let statusIcon = '⚪';
+        let searchIcon = '⚪';
+        let speedText = '-';
+        let speedColor = 'var(--text-muted)';
+
+        if (res) {
+          statusIcon = res.ok ? '✅' : '❌';
+          searchIcon = res.searchOk ? '✅' : '❌';
+          if (res.latency > 0) {
+            speedText = res.latency + 'ms';
+            speedColor = res.latency < 1500 ? 'var(--success)' : 'var(--warning)';
+          } else {
+            speedText = '失败';
+            speedColor = 'var(--danger)';
+          }
+        }
 
         const tr = document.createElement('tr');
         tr.id = 'row-' + index;
+        if (isDis) tr.className = 'is-disabled';
+
         tr.innerHTML = \`
-          <td style="text-align: center;"><span class="badge" id="status-\${index}">⚪</span></td>
+          <td style="text-align: center;"><span class="badge" id="status-\${index}">\${statusIcon}</span></td>
           <td>\${escapeHtml(item.name || '未命名')}</td>
           <td style="text-align: center;"><a class="link-btn" href="\${item.api}" target="_blank">Link</a></td>
-          <td style="text-align: center;" id="search-\${index}"><span class="badge">⚪</span></td>
-          <td style="text-align: center; color:var(--text-muted);" id="speed-\${index}">-</td>
+          <td style="text-align: center;" id="search-\${index}"><span class="badge">\${searchIcon}</span></td>
+          <td style="text-align: center; color:\${speedColor};" id="speed-\${index}">\${speedText}</td>
           <td style="text-align: center;">
             <label class="switch">
-              <input type="checkbox" \${isEnabled ? 'checked' : ''} data-index="\${index}" onchange="toggleEnable(\${index}, this.checked)">
+              <input type="checkbox" \${!isDis ? 'checked' : ''} onchange="toggleEnable(\${index}, this.checked)">
               <span class="slider"></span>
             </label>
           </td>
@@ -637,10 +712,10 @@ async function handleHomePage(origin, defaultPrefix, env) {
         tbody.appendChild(tr);
       });
 
-      document.getElementById('totalCount').innerText = sourcesList.length;
-      document.getElementById('disabledCount').innerText = disabledNum;
+      updateStats();
     }
 
+    // 切换配置
     async function switchSource(sourceKey) {
       if (currentSource === sourceKey && sourcesList.length > 0) return;
       currentSource = sourceKey;
@@ -651,7 +726,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
       const tbody = document.getElementById('tableBody');
       tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 20px; color:var(--text-muted);">正在拉取资源列表...</td></tr>';
-      
+
       try {
         const res = await fetch('/api/manage/sources?source=' + sourceKey);
         const data = await res.json();
@@ -659,16 +734,19 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
         sourcesList = data.list || [];
         disabledSet = new Set(data.disabled || []);
+        testResultsMap = data.testResults || {};
         renderTable();
       } catch (e) {
         tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color:var(--danger); padding: 15px;">加载失败: ' + e.message + '</td></tr>';
       }
     }
 
+    // 单个手动开关
     function toggleEnable(index, isChecked) {
       const item = sourcesList[index];
       if (!item) return;
-      const k = String(item.key || item.name || item.api);
+      const k = getItemKey(item);
+
       if (isChecked) {
         disabledSet.delete(k);
         if (item.name) disabledSet.delete(item.name);
@@ -678,15 +756,11 @@ async function handleHomePage(origin, defaultPrefix, env) {
         if (item.name) disabledSet.add(item.name);
         if (item.api) disabledSet.add(item.api);
       }
-      // 重新统计禁用个数
-      let num = 0;
-      sourcesList.forEach(it => {
-        const ik = String(it.key || it.name || it.api);
-        if (disabledSet.has(ik) || disabledSet.has(it.name) || disabledSet.has(it.api)) num++;
-      });
-      document.getElementById('disabledCount').innerText = num;
+
+      renderTable();
     }
 
+    // 单项测速
     async function testSingle(item, index) {
       const statusEl = document.getElementById('status-' + index);
       const searchEl = document.getElementById('search-' + index);
@@ -697,42 +771,60 @@ async function handleHomePage(origin, defaultPrefix, env) {
       const testSearchUrl = ORIGIN + '/?url=' + encodeURIComponent(targetUrl + delimiter + 'ac=detail&wd=爱');
 
       const startTime = Date.now();
+      const k = getItemKey(item);
+
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
+        const timeout = setTimeout(() => controller.abort(), 7000);
         const res = await fetch(testSearchUrl, { signal: controller.signal });
         clearTimeout(timeout);
-        
+
         const latency = Date.now() - startTime;
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const json = await res.json();
-        
+
         const hasList = (json && (Array.isArray(json.list) && json.list.length > 0)) || json.code === 1 || json.page !== undefined;
 
-        speedEl.innerText = latency + 'ms';
-        speedEl.style.color = latency < 1500 ? 'var(--success)' : 'var(--warning)';
-        statusEl.innerHTML = '✅';
-
         if (hasList) {
+          testResultsMap[k] = { ok: true, searchOk: true, latency };
+          speedEl.innerText = latency + 'ms';
+          speedEl.style.color = latency < 1500 ? 'var(--success)' : 'var(--warning)';
+          statusEl.innerHTML = '✅';
           searchEl.innerHTML = '✅';
           return true;
         } else {
-          searchEl.innerHTML = '❌';
-          return false;
+          throw new Error('No search list');
         }
       } catch (e) {
+        testResultsMap[k] = { ok: false, searchOk: false, latency: 0 };
         speedEl.innerText = '失败';
         speedEl.style.color = 'var(--danger)';
         statusEl.innerHTML = '❌';
         searchEl.innerHTML = '❌';
+
+        // 自动禁用失效源
+        disabledSet.add(k);
+        if (item.name) disabledSet.add(item.name);
+        if (item.api) disabledSet.add(item.api);
+
+        const row = document.getElementById('row-' + index);
+        if (row) {
+          row.className = 'is-disabled';
+          const checkbox = row.querySelector('input[type="checkbox"]');
+          if (checkbox) checkbox.checked = false;
+        }
         return false;
       }
     }
 
+    // 运行测速检测：自动禁用失效源 + 自动沉底 + 自动同步保存
     async function runSpeedTest() {
       if (isTesting) return;
       isTesting = true;
-      document.getElementById('startBtn').disabled = true;
+      const startBtn = document.getElementById('startBtn');
+      startBtn.disabled = true;
+      startBtn.innerText = '⚡ 测速中 (自动禁用失效源)...';
+
       let ok = 0, fail = 0;
       let cursor = 0;
 
@@ -743,27 +835,26 @@ async function handleHomePage(origin, defaultPrefix, env) {
           if (success) ok++; else fail++;
           document.getElementById('okCount').innerText = ok;
           document.getElementById('failCount').innerText = fail;
+          document.getElementById('disabledCount').innerText = disabledSet.size;
         }
       }
 
       await Promise.all(Array.from({ length: 4 }, worker));
-      isTesting = false;
-      document.getElementById('startBtn').disabled = false;
-    }
 
-    function disableFailedSources() {
-      sourcesList.forEach((item, index) => {
-        const searchEl = document.getElementById('search-' + index);
-        if (searchEl && searchEl.innerText.includes('❌')) {
-          const k = String(item.key || item.name || item.api);
-          disabledSet.add(k);
-          if (item.name) disabledSet.add(item.name);
-          if (item.api) disabledSet.add(item.api);
-        }
-      });
+      // 测速完成：失效源自动沉底重新排列
       renderTable();
+
+      // 测速完成：全自动后台同步存入 KV
+      await saveState(true);
+
+      isTesting = false;
+      startBtn.disabled = false;
+      startBtn.innerText = '🚀 开始测速检测 (自动禁用失效源并沉底)';
+
+      alert('🎉 测速已完成！\\n• 失效源已自动禁用并沉底\\n• 配置已自动保存同步至 KV 与播放器');
     }
 
+    // 重置恢复全部源
     async function resetSources() {
       if (!confirm('确定要清空所有禁用状态，恢复所有源吗？')) return;
       try {
@@ -773,6 +864,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
           body: JSON.stringify({ source: currentSource })
         });
         disabledSet.clear();
+        testResultsMap = {};
         await switchSource(currentSource);
         alert('已成功重置！所有源已恢复启用。');
       } catch (e) {
@@ -780,16 +872,17 @@ async function handleHomePage(origin, defaultPrefix, env) {
       }
     }
 
-    async function saveState() {
+    // 保存同步状态到 KV
+    async function saveState(isSilent = false) {
       const btn = document.getElementById('saveBtn');
-      btn.innerText = '保存中...';
-      btn.disabled = true;
+      if (!isSilent) {
+        btn.innerText = '保存中...';
+        btn.disabled = true;
+      }
 
-      // 提取完整的禁用集合（包含 key、name 与 api）
       const disabledPayload = [];
       sourcesList.forEach(item => {
-        const k = String(item.key || item.name || item.api);
-        if (disabledSet.has(k) || (item.name && disabledSet.has(item.name)) || (item.api && disabledSet.has(item.api))) {
+        if (isItemDisabled(item)) {
           if (item.key) disabledPayload.push(item.key);
           if (item.name) disabledPayload.push(item.name);
           if (item.api) disabledPayload.push(item.api);
@@ -802,23 +895,25 @@ async function handleHomePage(origin, defaultPrefix, env) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             source: currentSource,
-            disabled: Array.from(new Set(disabledPayload))
+            disabled: Array.from(new Set(disabledPayload)),
+            testResults: testResultsMap
           })
         });
         const ret = await res.json();
         if (ret.success) {
-          const disabledCount = parseInt(document.getElementById('disabledCount').innerText) || 0;
-          const totalCount = sourcesList.length;
-          const activeCount = totalCount - disabledCount;
-          alert(\`✅ 配置已成功保存并同步！\\n已剔除 \${disabledCount} 个禁用源，播放器拉取时仅返回剩余 \${activeCount} 个正常源。\\n\\n💡 提示：若播放器仍显示旧源，请在播放器内点击【刷新/重新载入配置】以清除本地缓存。\`);
+          if (!isSilent) {
+            alert('✅ 配置已成功保存同步！播放器拉取时已自动剔除禁用源。');
+          }
         } else {
-          alert('保存失败: ' + (ret.error || 'KV 存储未配置'));
+          if (!isSilent) alert('保存失败: ' + (ret.error || 'KV 存储未配置'));
         }
       } catch (e) {
-        alert('保存请求失败: ' + e.message);
+        if (!isSilent) alert('保存请求失败: ' + e.message);
       } finally {
-        btn.innerText = '💾 保存同步';
-        btn.disabled = false;
+        if (!isSilent) {
+          btn.innerText = '💾 保存同步';
+          btn.disabled = false;
+        }
       }
     }
 
@@ -846,6 +941,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
       return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
+    // 初始化渲染
     renderTable();
   </script>
 </body>
