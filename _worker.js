@@ -90,19 +90,26 @@ function base58Encode(data) {
 // ================= 源列表智能解析 =================
 function extractSourceList(data) {
   if (!data) return []
+  let list = []
   if (data.api_site && typeof data.api_site === 'object' && !Array.isArray(data.api_site)) {
-    return Object.entries(data.api_site).map(([key, val]) => ({
+    list = Object.entries(data.api_site).map(([key, val]) => ({
       key: key,
       name: (val && val.name) ? String(val.name).trim() : key,
       api: (val && val.api) ? String(val.api).trim() : '',
-      ...val
+      ...(typeof val === 'object' ? val : {})
     }))
+  } else {
+    for (const k of ['sites', 'video', 'sources', 'list']) {
+      if (Array.isArray(data[k])) { list = data[k]; break; }
+    }
+    if (list.length === 0 && Array.isArray(data)) list = data
   }
-  for (const k of ['sites', 'video', 'sources', 'list']) {
-    if (Array.isArray(data[k])) return data[k]
-  }
-  if (Array.isArray(data)) return data
-  return []
+
+  return list.map((item, idx) => {
+    const obj = typeof item === 'object' && item !== null ? { ...item } : { name: String(item), api: '' }
+    obj.id = String(obj.key || obj.api || obj.name || ('source_' + idx)).trim()
+    return obj
+  })
 }
 
 // ================= 严格过滤已禁用源 =================
@@ -112,10 +119,11 @@ function filterDisabled(data, disabledList = []) {
 
   const shouldRemove = (val, dictKey = '') => {
     if (dictKey && disabledSet.has(String(dictKey).trim().toLowerCase())) return true
-    if (val && typeof val === 'object') {
+    if (val && typeof val === 'object' && val !== null) {
       if (val.key && disabledSet.has(String(val.key).trim().toLowerCase())) return true
       if (val.name && disabledSet.has(String(val.name).trim().toLowerCase())) return true
       if (val.api && disabledSet.has(String(val.api).trim().toLowerCase())) return true
+      if (val.id && disabledSet.has(String(val.id).trim().toLowerCase())) return true
     } else if (typeof val === 'string') {
       if (disabledSet.has(val.trim().toLowerCase())) return true
     }
@@ -259,7 +267,6 @@ async function handleRequest(request, env, ctx) {
       const mergedGlobal = Array.from(new Set([...globalList, ...disabledArray]))
       await kv.put('DISABLED_GLOBAL', JSON.stringify(mergedGlobal))
 
-      // 清理缓存使订阅实时生效
       await kv.delete(`CONFIG_CACHE_${sourceKey}`).catch(() => {})
       return jsonResponse({ success: true, count: disabledArray.length })
     } catch (e) {
@@ -267,7 +274,7 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // 4. 重置恢复全部源
+  // 4. 重置全部源
   if (reqUrl.pathname === '/api/manage/reset' && request.method === 'POST') {
     const kv = getKV(env)
     if (kv) {
@@ -281,7 +288,7 @@ async function handleRequest(request, env, ctx) {
     return jsonResponse({ success: true })
   }
 
-  // 5. 播放器订阅拉取（强制禁用 CDN 与浏览器缓存）
+  // 5. 播放器订阅拉取
   if (reqUrl.searchParams.has('format')) {
     const formatParam = reqUrl.searchParams.get('format')
     const sourceParam = reqUrl.searchParams.get('source') || 'full'
@@ -452,7 +459,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
     .btn-copy { background: #0070f3; color: #fff; border: none; padding: 5px 12px; border-radius: 5px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
     .btn-copy:hover { opacity: 0.88; }
 
-    /* 平铺配置切换 */
     .config-tabs-container { margin-bottom: 14px; }
     .config-tabs-label { font-size: 13px; color: var(--text-muted); margin-bottom: 6px; display: block; }
     .config-tabs-row { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -506,13 +512,11 @@ async function handleHomePage(origin, defaultPrefix, env) {
   <h1>⚡ CORSAPI（API 代理 & JSON 订阅器）</h1>
   <div class="subtitle">基于 Cloudflare Workers 的中转代理，支持自动注入代理前缀并生成 Base58 格式订阅。</div>
 
-  <!-- 1. 通用 API 中转代理 -->
   <h2>1. 通用 API 中转代理</h2>
   <div style="position: relative;">
     <pre id="generalProxy">${defaultPrefix}https://ikunzyapi.com/api.php/provide/vod/</pre>
   </div>
 
-  <!-- 2. 订阅链接生成 -->
   <h2>2. 订阅链接生成</h2>
 
   <div class="card">
@@ -551,7 +555,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
     </div>
   </div>
 
-  <!-- 3. 资源源测速与可用性管理 -->
   <h2>📊 资源源测速与可用性管理</h2>
   <div class="card">
     <div class="config-tabs-container">
@@ -601,26 +604,42 @@ async function handleHomePage(origin, defaultPrefix, env) {
     let testResultsMap = ${JSON.stringify(initialTestResults)};
     let isTesting = false;
 
-    // 获取源的通用 key
+    // 获取源的通用 ID
     function getItemKey(item) {
-      return String(item.key || item.name || item.api);
+      return String(item.id || item.key || item.api || item.name || '').trim();
     }
 
-    // 检查源是否被禁用
+    // 判断源是否被禁用
     function isItemDisabled(item) {
+      if (!item) return false;
       const k = getItemKey(item);
-      return disabledSet.has(k) || (item.name && disabledSet.has(item.name)) || (item.api && disabledSet.has(item.api));
+      if (disabledSet.has(k)) return true;
+      if (item.key && disabledSet.has(String(item.key))) return true;
+      if (item.name && disabledSet.has(String(item.name))) return true;
+      if (item.api && disabledSet.has(String(item.api))) return true;
+      return false;
     }
 
-    // 沉底排序：正常可用源置顶在前，失效和禁用的源沉底在后
+    // 精确统计当前列表中已禁用的源数量（彻底解决不准确问题）
+    function countDisabled() {
+      let count = 0;
+      for (let i = 0; i < sourcesList.length; i++) {
+        if (isItemDisabled(sourcesList[i])) count++;
+      }
+      return count;
+    }
+
+    // 沉底排序：正常可用源置顶，失效和已禁用源沉底
     function sortSources() {
       sourcesList.sort((a, b) => {
         const disA = isItemDisabled(a);
         const disB = isItemDisabled(b);
         if (disA !== disB) return disA ? 1 : -1;
 
-        const resA = testResultsMap[getItemKey(a)];
-        const resB = testResultsMap[getItemKey(b)];
+        const kA = getItemKey(a);
+        const kB = getItemKey(b);
+        const resA = testResultsMap[kA];
+        const resB = testResultsMap[kB];
         const failA = resA ? (!resA.ok || !resA.searchOk) : false;
         const failB = resB ? (!resB.ok || !resB.searchOk) : false;
         if (failA !== failB) return failA ? 1 : -1;
@@ -631,10 +650,10 @@ async function handleHomePage(origin, defaultPrefix, env) {
       });
     }
 
-    // 计算统计数据（避免显示为0）
+    // 更新统计栏数字
     function updateStats() {
       const total = sourcesList.length;
-      let disabledNum = 0;
+      const disabledNum = countDisabled();
       let okNum = 0;
       let failNum = 0;
 
@@ -643,16 +662,16 @@ async function handleHomePage(origin, defaultPrefix, env) {
       sourcesList.forEach(item => {
         const k = getItemKey(item);
         const dis = isItemDisabled(item);
-        if (dis) disabledNum++;
-
         const res = testResultsMap[k];
         if (res) {
-          if (res.ok && res.searchOk && !dis) okNum++;
-          else failNum++;
+          if (res.ok && res.searchOk && !dis) {
+            okNum++;
+          } else {
+            failNum++;
+          }
         }
       });
 
-      // 若尚未进行过任何测速，将启用的源计入可用，失效数显示为 0
       if (!hasHistory) {
         okNum = total - disabledNum;
         failNum = 0;
@@ -741,7 +760,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
       }
     }
 
-    // 单个手动开关
+    // 开关启用/禁用
     function toggleEnable(index, isChecked) {
       const item = sourcesList[index];
       if (!item) return;
@@ -749,18 +768,17 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
       if (isChecked) {
         disabledSet.delete(k);
-        if (item.name) disabledSet.delete(item.name);
-        if (item.api) disabledSet.delete(item.api);
+        if (item.key) disabledSet.delete(String(item.key));
+        if (item.name) disabledSet.delete(String(item.name));
+        if (item.api) disabledSet.delete(String(item.api));
       } else {
         disabledSet.add(k);
-        if (item.name) disabledSet.add(item.name);
-        if (item.api) disabledSet.add(item.api);
       }
 
       renderTable();
     }
 
-    // 单项测速
+    // 单项真实测速与搜索检测
     async function testSingle(item, index) {
       const statusEl = document.getElementById('status-' + index);
       const searchEl = document.getElementById('search-' + index);
@@ -804,8 +822,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
         // 自动禁用失效源
         disabledSet.add(k);
-        if (item.name) disabledSet.add(item.name);
-        if (item.api) disabledSet.add(item.api);
 
         const row = document.getElementById('row-' + index);
         if (row) {
@@ -835,16 +851,16 @@ async function handleHomePage(origin, defaultPrefix, env) {
           if (success) ok++; else fail++;
           document.getElementById('okCount').innerText = ok;
           document.getElementById('failCount').innerText = fail;
-          document.getElementById('disabledCount').innerText = disabledSet.size;
+          document.getElementById('disabledCount').innerText = countDisabled();
         }
       }
 
       await Promise.all(Array.from({ length: 4 }, worker));
 
-      // 测速完成：失效源自动沉底重新排列
+      // 测速完成：排序沉底
       renderTable();
 
-      // 测速完成：全自动后台同步存入 KV
+      // 自动同步保存至 KV
       await saveState(true);
 
       isTesting = false;
@@ -883,9 +899,9 @@ async function handleHomePage(origin, defaultPrefix, env) {
       const disabledPayload = [];
       sourcesList.forEach(item => {
         if (isItemDisabled(item)) {
-          if (item.key) disabledPayload.push(item.key);
-          if (item.name) disabledPayload.push(item.name);
-          if (item.api) disabledPayload.push(item.api);
+          if (item.key) disabledPayload.push(String(item.key));
+          if (item.name) disabledPayload.push(String(item.name));
+          if (item.api) disabledPayload.push(String(item.api));
         }
       });
 
@@ -941,7 +957,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
-    // 初始化渲染
     renderTable();
   </script>
 </body>
