@@ -244,7 +244,7 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // 3. 保存禁用列表和测速状态到 KV
+  // 3. 保存禁用列表和测速状态到 KV（仅在用户点击保存按钮时触发）
   if (reqUrl.pathname === '/api/manage/save-disabled' && request.method === 'POST') {
     const kv = getKV(env)
     if (!kv) return jsonResponse({ error: '未检测到绑定的 KV 空间' }, 400)
@@ -274,21 +274,7 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // 4. 重置全部源
-  if (reqUrl.pathname === '/api/manage/reset' && request.method === 'POST') {
-    const kv = getKV(env)
-    if (kv) {
-      const body = await request.json()
-      const source = body.source || 'jingjian'
-      await kv.delete(`DISABLED_${source}`)
-      await kv.delete(`TEST_RESULTS_${source}`)
-      await kv.delete('DISABLED_GLOBAL')
-      await kv.delete('CONFIG_CACHE_' + source)
-    }
-    return jsonResponse({ success: true })
-  }
-
-  // 5. 播放器订阅拉取
+  // 4. 播放器订阅拉取（强制禁用 CDN 与浏览器缓存）
   if (reqUrl.searchParams.has('format')) {
     const formatParam = reqUrl.searchParams.get('format')
     const sourceParam = reqUrl.searchParams.get('source') || 'full'
@@ -296,7 +282,7 @@ async function handleRequest(request, env, ctx) {
     return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, env)
   }
 
-  // 6. 首页展示
+  // 5. 首页展示
   return handleHomePage(currentOrigin, defaultPrefix, env)
 }
 
@@ -512,11 +498,13 @@ async function handleHomePage(origin, defaultPrefix, env) {
   <h1>⚡ CORSAPI（API 代理 & JSON 订阅器）</h1>
   <div class="subtitle">基于 Cloudflare Workers 的中转代理，支持自动注入代理前缀并生成 Base58 格式订阅。</div>
 
+  <!-- 1. 通用 API 中转代理 -->
   <h2>1. 通用 API 中转代理</h2>
   <div style="position: relative;">
     <pre id="generalProxy">${defaultPrefix}https://ikunzyapi.com/api.php/provide/vod/</pre>
   </div>
 
+  <!-- 2. 订阅链接生成 -->
   <h2>2. 订阅链接生成</h2>
 
   <div class="card">
@@ -555,6 +543,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
     </div>
   </div>
 
+  <!-- 3. 资源源测速与可用性管理 -->
   <h2>📊 资源源测速与可用性管理</h2>
   <div class="card">
     <div class="config-tabs-container">
@@ -567,9 +556,10 @@ async function handleHomePage(origin, defaultPrefix, env) {
     </div>
 
     <div class="btn-group">
-      <button class="btn-action btn-blue" id="startBtn" onclick="runSpeedTest()">🚀 开始测速检测 (自动禁用失效源并沉底)</button>
-      <button class="btn-action btn-orange" onclick="resetSources()">🔄 重置全部源 (解除禁用)</button>
-      <button class="btn-action btn-green" id="saveBtn" onclick="saveState(false)">💾 保存同步</button>
+      <!-- 按钮名称已按要求精简 -->
+      <button class="btn-action btn-blue" id="startBtn" onclick="runSpeedTest()">🚀 检测</button>
+      <button class="btn-action btn-orange" onclick="resetSources()">🔄 重置</button>
+      <button class="btn-action btn-green" id="saveBtn" onclick="saveState()">💾 保存同步</button>
     </div>
 
     <div class="stats-bar">
@@ -604,12 +594,10 @@ async function handleHomePage(origin, defaultPrefix, env) {
     let testResultsMap = ${JSON.stringify(initialTestResults)};
     let isTesting = false;
 
-    // 获取源的通用 ID
     function getItemKey(item) {
       return String(item.id || item.key || item.api || item.name || '').trim();
     }
 
-    // 判断源是否被禁用
     function isItemDisabled(item) {
       if (!item) return false;
       const k = getItemKey(item);
@@ -620,7 +608,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       return false;
     }
 
-    // 精确统计当前列表中已禁用的源数量（彻底解决不准确问题）
     function countDisabled() {
       let count = 0;
       for (let i = 0; i < sourcesList.length; i++) {
@@ -629,7 +616,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
       return count;
     }
 
-    // 沉底排序：正常可用源置顶，失效和已禁用源沉底
+    // 沉底排序：正常可用源置顶在前，失效和禁用的源沉底在后
     function sortSources() {
       sourcesList.sort((a, b) => {
         const disA = isItemDisabled(a);
@@ -650,7 +637,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       });
     }
 
-    // 更新统计栏数字
     function updateStats() {
       const total = sourcesList.length;
       const disabledNum = countDisabled();
@@ -683,7 +669,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       document.getElementById('disabledCount').innerText = disabledNum;
     }
 
-    // 渲染表格
     function renderTable() {
       sortSources();
       const tbody = document.getElementById('tableBody');
@@ -734,7 +719,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       updateStats();
     }
 
-    // 切换配置
     async function switchSource(sourceKey) {
       if (currentSource === sourceKey && sourcesList.length > 0) return;
       currentSource = sourceKey;
@@ -760,7 +744,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       }
     }
 
-    // 开关启用/禁用
     function toggleEnable(index, isChecked) {
       const item = sourcesList[index];
       if (!item) return;
@@ -778,7 +761,7 @@ async function handleHomePage(origin, defaultPrefix, env) {
       renderTable();
     }
 
-    // 单项真实测速与搜索检测
+    // 单项测速
     async function testSingle(item, index) {
       const statusEl = document.getElementById('status-' + index);
       const searchEl = document.getElementById('search-' + index);
@@ -833,13 +816,13 @@ async function handleHomePage(origin, defaultPrefix, env) {
       }
     }
 
-    // 运行测速检测：自动禁用失效源 + 自动沉底 + 自动同步保存
+    // 🚀 检测：自动禁用失效源 + 自动沉底，但不自动保存同步
     async function runSpeedTest() {
       if (isTesting) return;
       isTesting = true;
       const startBtn = document.getElementById('startBtn');
       startBtn.disabled = true;
-      startBtn.innerText = '⚡ 测速中 (自动禁用失效源)...';
+      startBtn.innerText = '⚡ 检测中...';
 
       let ok = 0, fail = 0;
       let cursor = 0;
@@ -857,44 +840,32 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
       await Promise.all(Array.from({ length: 4 }, worker));
 
-      // 测速完成：排序沉底
+      // 测速完成：按可用/失效自动排序沉底
       renderTable();
-
-      // 自动同步保存至 KV
-      await saveState(true);
 
       isTesting = false;
       startBtn.disabled = false;
-      startBtn.innerText = '🚀 开始测速检测 (自动禁用失效源并沉底)';
+      startBtn.innerText = '🚀 检测';
 
-      alert('🎉 测速已完成！\\n• 失效源已自动禁用并沉底\\n• 配置已自动保存同步至 KV 与播放器');
+      alert('🎉 检测完成！\\n• 失效源已自动禁用并沉底\\n• 请核对无误后，手动点击【💾 保存同步】生效');
     }
 
-    // 重置恢复全部源
-    async function resetSources() {
-      if (!confirm('确定要清空所有禁用状态，恢复所有源吗？')) return;
-      try {
-        await fetch('/api/manage/reset', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ source: currentSource })
-        });
-        disabledSet.clear();
-        testResultsMap = {};
-        await switchSource(currentSource);
-        alert('已成功重置！所有源已恢复启用。');
-      } catch (e) {
-        alert('重置失败: ' + e.message);
-      }
+    // 🔄 重置：自动全选解禁并重新排序，但不自动保存同步
+    function resetSources() {
+      if (!confirm('确定要在页面上恢复所有源吗？\\n(注意：此操作仅在当前页面解禁，需点击【💾 保存同步】后才会真正同步至播放器)')) return;
+      // 清空本地禁用和测速记录
+      disabledSet.clear();
+      testResultsMap = {};
+      // 重新渲染表格：所有源恢复开启状态并重新排列
+      renderTable();
+      alert('已在页面上恢复启用所有源！\\n若确认生效，请点击【💾 保存同步】。');
     }
 
-    // 保存同步状态到 KV
-    async function saveState(isSilent = false) {
+    // 💾 手动保存同步状态到 KV
+    async function saveState() {
       const btn = document.getElementById('saveBtn');
-      if (!isSilent) {
-        btn.innerText = '保存中...';
-        btn.disabled = true;
-      }
+      btn.innerText = '保存中...';
+      btn.disabled = true;
 
       const disabledPayload = [];
       sourcesList.forEach(item => {
@@ -917,19 +888,18 @@ async function handleHomePage(origin, defaultPrefix, env) {
         });
         const ret = await res.json();
         if (ret.success) {
-          if (!isSilent) {
-            alert('✅ 配置已成功保存同步！播放器拉取时已自动剔除禁用源。');
-          }
+          const disabledCount = countDisabled();
+          const totalCount = sourcesList.length;
+          const activeCount = totalCount - disabledCount;
+          alert(\`✅ 配置已成功保存同步！\\n当前已剔除 \${disabledCount} 个禁用源，播放器拉取时仅同步剩余 \${activeCount} 个正常源。\`);
         } else {
-          if (!isSilent) alert('保存失败: ' + (ret.error || 'KV 存储未配置'));
+          alert('保存失败: ' + (ret.error || 'KV 存储未配置'));
         }
       } catch (e) {
-        if (!isSilent) alert('保存请求失败: ' + e.message);
+        alert('保存请求失败: ' + e.message);
       } finally {
-        if (!isSilent) {
-          btn.innerText = '💾 保存同步';
-          btn.disabled = false;
-        }
+        btn.innerText = '💾 保存同步';
+        btn.disabled = false;
       }
     }
 
