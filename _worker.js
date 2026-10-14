@@ -244,7 +244,7 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // 3. 保存禁用列表和测速状态到 KV（仅在用户点击保存按钮时触发）
+  // 3. 保存禁用列表和测速状态到 KV（手动点击保存时触发）
   if (reqUrl.pathname === '/api/manage/save-disabled' && request.method === 'POST') {
     const kv = getKV(env)
     if (!kv) return jsonResponse({ error: '未检测到绑定的 KV 空间' }, 400)
@@ -274,7 +274,7 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
-  // 4. 播放器订阅拉取（强制禁用 CDN 与浏览器缓存）
+  // 4. 播放器订阅拉取
   if (reqUrl.searchParams.has('format')) {
     const formatParam = reqUrl.searchParams.get('format')
     const sourceParam = reqUrl.searchParams.get('source') || 'full'
@@ -476,9 +476,44 @@ async function handleHomePage(origin, defaultPrefix, env) {
     .stats-bar { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; padding: 2px 0; }
     .stats-bar span { font-weight: bold; color: #fff; margin: 0 3px; }
 
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    /* 滚轮式容器设计（固定高度 + 滚动条） */
+    .table-scroll-container {
+      max-height: 520px;
+      overflow-y: auto;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #15181e;
+      position: relative;
+    }
+    /* 自定义深色精致滚动条 */
+    .table-scroll-container::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .table-scroll-container::-webkit-scrollbar-track {
+      background: #121417;
+    }
+    .table-scroll-container::-webkit-scrollbar-thumb {
+      background: #2a303c;
+      border-radius: 4px;
+    }
+    .table-scroll-container::-webkit-scrollbar-thumb:hover {
+      background: #3f4756;
+    }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 0; }
     th, td { border: 1px solid var(--border); padding: 10px 8px; text-align: left; }
-    th { background: #161a20; color: #94a3b8; font-weight: 500; }
+    /* 表头吸顶置顶，滚动时不被遮挡 */
+    th {
+      background: #181c22;
+      color: #94a3b8;
+      font-weight: 500;
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      box-shadow: 0 1px 0 var(--border);
+    }
     tr:nth-child(even) { background: #16191f; }
     tr.is-disabled { opacity: 0.55; background: rgba(0, 0, 0, 0.2); }
     .badge { display: inline-flex; align-items: center; justify-content: center; font-size: 14px; }
@@ -556,7 +591,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
     </div>
 
     <div class="btn-group">
-      <!-- 按钮名称已按要求精简 -->
       <button class="btn-action btn-blue" id="startBtn" onclick="runSpeedTest()">🚀 检测</button>
       <button class="btn-action btn-orange" onclick="resetSources()">🔄 重置</button>
       <button class="btn-action btn-green" id="saveBtn" onclick="saveState()">💾 保存同步</button>
@@ -569,7 +603,8 @@ async function handleHomePage(origin, defaultPrefix, env) {
       已禁用: <span id="disabledCount" style="color:var(--warning)">0</span>
     </div>
 
-    <div style="overflow-x: auto;">
+    <!-- 滚轮式容器 -->
+    <div class="table-scroll-container">
       <table>
         <thead>
           <tr>
@@ -616,7 +651,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       return count;
     }
 
-    // 沉底排序：正常可用源置顶在前，失效和禁用的源沉底在后
     function sortSources() {
       sourcesList.sort((a, b) => {
         const disA = isItemDisabled(a);
@@ -761,7 +795,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       renderTable();
     }
 
-    // 单项测速
     async function testSingle(item, index) {
       const statusEl = document.getElementById('status-' + index);
       const searchEl = document.getElementById('search-' + index);
@@ -803,7 +836,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
         statusEl.innerHTML = '❌';
         searchEl.innerHTML = '❌';
 
-        // 自动禁用失效源
         disabledSet.add(k);
 
         const row = document.getElementById('row-' + index);
@@ -816,7 +848,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
       }
     }
 
-    // 🚀 检测：自动禁用失效源 + 自动沉底，但不自动保存同步
     async function runSpeedTest() {
       if (isTesting) return;
       isTesting = true;
@@ -840,7 +871,6 @@ async function handleHomePage(origin, defaultPrefix, env) {
 
       await Promise.all(Array.from({ length: 4 }, worker));
 
-      // 测速完成：按可用/失效自动排序沉底
       renderTable();
 
       isTesting = false;
@@ -850,18 +880,14 @@ async function handleHomePage(origin, defaultPrefix, env) {
       alert('🎉 检测完成！\\n• 失效源已自动禁用并沉底\\n• 请核对无误后，手动点击【💾 保存同步】生效');
     }
 
-    // 🔄 重置：自动全选解禁并重新排序，但不自动保存同步
     function resetSources() {
       if (!confirm('确定要在页面上恢复所有源吗？\\n(注意：此操作仅在当前页面解禁，需点击【💾 保存同步】后才会真正同步至播放器)')) return;
-      // 清空本地禁用和测速记录
       disabledSet.clear();
       testResultsMap = {};
-      // 重新渲染表格：所有源恢复开启状态并重新排列
       renderTable();
       alert('已在页面上恢复启用所有源！\\n若确认生效，请点击【💾 保存同步】。');
     }
 
-    // 💾 手动保存同步状态到 KV
     async function saveState() {
       const btn = document.getElementById('saveBtn');
       btn.innerText = '保存中...';
