@@ -2,6 +2,14 @@
 export default {
   async fetch(request, env, ctx) {
     return handleRequest(request, env, ctx)
+  },
+  // 在 Cloudflare Worker 的 Triggers 中配置 Cron 后，每次定时触发会执行这里
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(
+      syncTrendingRecommendations(env).catch(error => {
+        console.error('TMDB 热门影视同步失败:', error)
+      })
+    )
   }
 }
 
@@ -212,6 +220,25 @@ async function handleRequest(request, env, ctx) {
   const reqUrl = new URL(request.url)
   const currentOrigin = reqUrl.origin
   const defaultPrefix = `${currentOrigin}/?url=`
+
+  // 0. TMDB 热门电影/电视剧推荐接口（必须放在通用 ?url= 代理路由之前）
+  if (reqUrl.pathname === '/api/recommendations' && request.method === 'GET') {
+    return readTrendingRecommendations(env)
+  }
+
+  // 手动触发同步：需要在 Cloudflare Secret 中配置 SYNC_SECRET
+  if (reqUrl.pathname === '/api/recommendations/sync' && request.method === 'POST') {
+    if (!env.SYNC_SECRET ||
+        request.headers.get('Authorization') !== `Bearer ${env.SYNC_SECRET}`) {
+      return jsonResponse({ error: 'Unauthorized' }, 401)
+    }
+    try {
+      const result = await syncTrendingRecommendations(env)
+      return jsonResponse({ success: true, ...result })
+    } catch (error) {
+      return jsonResponse({ error: error?.message || '热门影视同步失败' }, 500)
+    }
+  }
 
   // 1. 通用 API 反代转发
   if (reqUrl.searchParams.has('url') || request.url.includes('?url=')) {
@@ -962,6 +989,114 @@ async function handleHomePage(origin, defaultPrefix, env) {
     status: 200,
     headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS }
   })
+}
+
+// ================= TMDB 每日热门影视推荐 =================
+// 使用现有 KV 绑定缓存；不会写入 D1。
+// Cloudflare Cron Trigger 需要另行设置为：0 3 * * *（每天北京时间 11:00）
+const TRENDING_CACHE_KEY = 'shiguang_trending_cache_v1'
+const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p/'
+
+async function fetchTMDBTrending(mediaType, env) {
+  if (!env.TMDB_API_KEY) {
+    throw new Error('缺少 TMDB_API_KEY，请在 Cloudflare Worker Secrets 中配置')
+  }
+
+  const url = new URL(`https://api.themoviedb.org/3/trending/${mediaType}/day`)
+  url.searchParams.set('api_key', env.TMDB_API_KEY)
+  url.searchParams.set('language', 'zh-CN')
+
+  const response = await fetch(url.toString(), {
+    headers: { Accept: 'application/json' }
+  })
+  if (!response.ok) {
+    throw new Error(`TMDB ${mediaType} 请求失败：HTTP ${response.status}`)
+  }
+
+  const data = await response.json()
+  const results = Array.isArray(data.results) ? data.results : []
+
+  return results
+    .filter(item => item && item.poster_path && (item.title || item.name))
+    .map(item => {
+      const releaseDate = String(item.release_date || item.first_air_date || '')
+      return {
+        id: Number(item.id),
+        title: String(item.title || item.name || ''),
+        type: mediaType === 'movie' ? '电影' : '电视剧',
+        year: releaseDate.slice(0, 4),
+        releaseDate,
+        overview: String(item.overview || '').slice(0, 600),
+        poster: `${TMDB_IMAGE_BASE}w500${item.poster_path}`,
+        backdrop: item.backdrop_path ? `${TMDB_IMAGE_BASE}w1280${item.backdrop_path}` : '',
+        voteAverage: Number(item.vote_average || 0),
+        voteCount: Number(item.vote_count || 0),
+        popularity: Number(item.popularity || 0),
+        originalLanguage: String(item.original_language || '')
+      }
+    })
+    .sort((a, b) => b.popularity - a.popularity)
+    .slice(0, 30)
+}
+
+async function syncTrendingRecommendations(env) {
+  const kv = getKV(env)
+  if (!kv || typeof kv.put !== 'function') {
+    throw new Error('没有找到 KV 绑定。请确认 Worker 已绑定现有 KV 命名空间')
+  }
+
+  const [movies, shows] = await Promise.all([
+    fetchTMDBTrending('movie', env),
+    fetchTMDBTrending('tv', env)
+  ])
+
+  // 电影与电视剧交替排列，避免列表被单一类型占满
+  const items = []
+  const maxLength = Math.max(movies.length, shows.length)
+  for (let i = 0; i < maxLength; i++) {
+    if (movies[i]) items.push(movies[i])
+    if (shows[i]) items.push(shows[i])
+  }
+
+  const payload = {
+    source: 'TMDB',
+    updatedAt: new Date().toISOString(),
+    counts: { movies: movies.length, shows: shows.length, total: items.length },
+    items
+  }
+
+  // 缓存 48 小时，避免定时任务偶发失败后首页立即变空
+  await kv.put(TRENDING_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 172800 })
+
+  return {
+    updatedAt: payload.updatedAt,
+    movies: movies.length,
+    shows: shows.length,
+    total: items.length
+  }
+}
+
+async function readTrendingRecommendations(env) {
+  const kv = getKV(env)
+  if (!kv || typeof kv.get !== 'function') {
+    return jsonResponse({ error: '没有找到 KV 绑定' }, 500)
+  }
+
+  try {
+    const value = await kv.get(TRENDING_CACHE_KEY)
+    if (!value) {
+      return jsonResponse({
+        source: 'TMDB',
+        updatedAt: null,
+        counts: { movies: 0, shows: 0, total: 0 },
+        items: [],
+        message: '热门榜尚未生成，请在 Cloudflare 中执行一次手动同步或等待 Cron 定时任务'
+      })
+    }
+    return jsonResponse(JSON.parse(value))
+  } catch (error) {
+    return jsonResponse({ error: error?.message || '读取热门影视缓存失败' }, 500)
+  }
 }
 
 function jsonResponse(data, status = 200) {
